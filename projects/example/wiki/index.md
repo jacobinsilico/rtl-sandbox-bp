@@ -1,6 +1,6 @@
 # Example Wiki
 
-Design documentation for the **example** project — the flow-validation design shipped with the template. Each page summarizes and cross-references the project's own `rtl/` and `tb/` sources and links back to them. See [log.md](log.md) for the change history.
+Design documentation for the **example** project — the flow-validation design shipped with the template. Each page summarizes and cross-references the project's own `rtl/` and `tb/` sources and links back to them.
 
 > Organized as: **architectures/** — the top-level assemblies (`top_example`); **modules/** — the reusable building blocks (the `mac_n` core, its `mul_n` / `add_tree_n` / `add_n` datapath primitives, and the `reg_n` register bank); **testbenches/** — the self-checking testbenches (`tb_<module>`); plus `concepts/`, `decisions/`, `experiments/`, `references/`, empty until the project grows.
 

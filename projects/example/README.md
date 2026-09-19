@@ -145,6 +145,59 @@ Reference results of this sequence:
 | `post-pnr-sta`                     | 2 s  | WNS 0, worst slack +556.2 ps through the macro's timing model.                                                                                                                                    |
 | `post-pnr-dpa`                     | 2 s  | 0.694 mW total in full-view mode; `power_macros.rpt` attributes 0.425 mW to `mac_n_i`.                                                                                                            |
 
+### The same flow on the `smic-n3` metal stack
+
+`BEOL=smic-n3` runs place-and-route on the second metal stack of the platform repository: ASAP7's cells with M1 and M2 kept, and SMIC N+3's pitches from M3 to M11 (44 nm on M3, 80 nm on M4–M6, 128 nm on M7–M10, 148 nm on M11). The cells do not change, so synthesis and its analyses are the ones above and only the `pnr` runs and what follows them are repeated; the output directories take a `_smic-n3` suffix. The first coarse layer of this stack is M4 rather than M5, which moves the hierarchical recipe one layer down: the block is capped at M4, with its clock floor at M3 and its top and bottom pins on M3, and takes [pdn_tile_smic-n3.tcl](../../scripts/pnr/pdn_tile_smic-n3.tcl) (M3 straps tying the rails, M4 mesh exposed as power pins); the parent takes [pdn_macro_smic-n3.tcl](../../scripts/pnr/pdn_macro_smic-n3.tcl) (M5/M6 mesh, the M5 straps dropped onto the block's M4 pins) and may route up to M10.
+
+```bash
+# Flat
+make pnr PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=pnr_top_example_smic-n3 NETLIST_DIR=syn_top_example \
+    PINS=projects/example/scripts/pins_top_example.tcl BEOL=smic-n3
+make post-pnr-sim PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=sim_post_pnr_top_example_smic-n3 NETLIST_DIR=pnr_top_example_smic-n3 VCD=1
+make post-pnr-sta PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=sta_post_pnr_top_example_smic-n3 NETLIST_DIR=pnr_top_example_smic-n3
+make post-pnr-dpa PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=dpa_post_pnr_top_example_smic-n3 NETLIST_DIR=pnr_top_example_smic-n3 VCD_DIR=sim_post_pnr_top_example_smic-n3
+
+# Hierarchical: the block capped at M4, then the parent around it (both reuse the synthesis runs above)
+make pnr PROJECT=example TOP_LEVEL=mac_n CLK_PERIOD_NS=1.5 OUT_DIR=mac_n_pnr_smic-n3 NETLIST_DIR=mac_n_syn BEOL=smic-n3 \
+    MAX_ROUTE_LAYER=M4 MIN_CLK_LAYER=M3 PIN_LAYERS_VER=M3 PDN=scripts/pnr/pdn_tile_smic-n3.tcl PINS=projects/example/scripts/pins_mac_n.tcl
+make pnr PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=pnr_top_example_hier_smic-n3 NETLIST_DIR=syn_top_example_hier BEOL=smic-n3 \
+    MAX_ROUTE_LAYER=M10 PDN=scripts/pnr/pdn_macro_smic-n3.tcl MACRO_DIRS=mac_n_pnr_smic-n3 \
+    FLOORPLAN=projects/example/scripts/floorplan_top_example.tcl PINS=projects/example/scripts/pins_top_example.tcl
+make post-pnr-sim PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=sim_post_pnr_top_example_hier_smic-n3 NETLIST_DIR=pnr_top_example_hier_smic-n3 MACRO_DIRS=mac_n_pnr_smic-n3 VCD=1
+make post-pnr-sta PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=sta_post_pnr_top_example_hier_smic-n3 NETLIST_DIR=pnr_top_example_hier_smic-n3 MACRO_DIRS=mac_n_pnr_smic-n3
+make post-pnr-dpa PROJECT=example TOP_LEVEL=top_example CLK_PERIOD_NS=1.5 OUT_DIR=dpa_post_pnr_top_example_hier_smic-n3 NETLIST_DIR=pnr_top_example_hier_smic-n3 MACRO_DIRS=mac_n_pnr_smic-n3 VCD_DIR=sim_post_pnr_top_example_hier_smic-n3
+```
+
+Reference results, next to the stock stack's from the two tables above:
+
+| Step                  | Quantity                       | ASAP7 stack          | `smic-n3` stack      |
+| --------------------- | ------------------------------ | -------------------- | -------------------- |
+| `pnr` flat            | Time                           | 78 s                 | 107 s                |
+|                       | Design area                    | 329 µm²              | 329 µm²              |
+|                       | Worst slack                    | +540.4 ps            | +517.9 ps            |
+|                       | `route_drc.rpt`                | empty                | empty                |
+|                       | Wire length, vias              | 7518 µm, 26397       | 7662 µm, 25763       |
+|                       | Wire length on M2 / M3 / above | 3157 / 3373 / 986 µm | 3334 / 3329 / 996 µm |
+|                       | Setup clock skew               | 5.0 ps               | 7.4 ps               |
+| `post-pnr-sim` flat   | Result                         | `PASSED`             | `PASSED`             |
+| `post-pnr-dpa` flat   | Total power, clock share       | 0.610 mW, 8.7 %      | 0.616 mW, 9.2 %      |
+| `pnr` `mac_n`         | Time                           | 46 s                 | 69 s                 |
+|                       | Design area                    | 285 µm²              | 285 µm²              |
+|                       | Worst slack                    | +718.9 ps            | +681.5 ps            |
+|                       | `route_drc.rpt`                | empty                | empty                |
+|                       | Wire length                    | 7201 µm              | 7503 µm              |
+|                       | Abstract obstructions          | M1–M5                | M1–M4                |
+|                       | Power pins, top-edge pins      | M5, M5               | M4, M3               |
+| `pnr` parent          | Time                           | 72 s                 | 133 s                |
+|                       | Design area                    | 993 µm²              | 993 µm²              |
+|                       | Worst slack                    | +556.2 ps            | +517.9 ps            |
+|                       | `route_drc.rpt`                | empty                | empty                |
+|                       | Wire length                    | 1596 µm              | 1619 µm              |
+| `post-pnr-sim` parent | Result                         | `PASSED`             | `PASSED`             |
+| `post-pnr-dpa` parent | Total power, `mac_n_i`         | 0.694, 0.425 mW      | 0.697, 0.428 mW      |
+
+The design is far too small to fill either stack, so both route clean and the areas are identical: what this comparison proves is that every file of the new stack works, in the flat and in the hierarchical flow, not how much routing capacity it has. The differences that do show are the expected ones. Placement is routability-driven and sees fewer tracks, so it spreads the cells a little differently, which costs 1 to 4 % of wire length and 20 to 40 ps of slack on a path of about one nanosecond. Detailed routing starts from more violations (476 against 342 in the flat run) and takes 1.5 to 2 times as long to clear them; most of the extra ones are line-end violations on M2 and M3, the likely cause being that M3 at 44 nm no longer lines up with the 36 nm grid of the two layers below it. Power moves by less than one percent, since it is set by the cells. The block run is the one place where capacity already binds: with M2 to M4 only, the global router needs overflow iterations, and while it reroutes nets in its second pass the log fills with `EST-0026 Missing route to pin` warnings from the parasitics estimator. They are transient; the pass ends with every net routed.
+
 ### Cleanup
 
 ```bash

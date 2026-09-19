@@ -9,6 +9,7 @@
 # areas; an M6 mesh runs over the whole core - including the macros, since M6 is
 # free - and drops onto each macro's M5 power pins. M7 carries no power and is
 # left entirely for the parent to route over the macros.
+# This is the file for the stock ASAP7 stack; BEOL=smic-n3 takes pdn_macro_smic-n3.tcl.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
