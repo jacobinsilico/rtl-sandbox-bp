@@ -52,15 +52,18 @@ set_routing_layers \
     -signal $MIN_ROUTE_LAYER-$MAX_ROUTE_LAYER \
     -clock  $MIN_CLK_LAYER-$MAX_ROUTE_LAYER
 
-global_route -congestion_iterations 30 -verbose
+set GRT_ARGS {-congestion_iterations 30 -verbose}
+if {$::env(SEL_ALLOW_CONGESTION) ne "0"} {
+    lappend GRT_ARGS -allow_congestion
+}
+global_route {*}$GRT_ARGS
 ```
 
 The two layer policies (M2–M7 signals, M4–M7 clocks, 25 % capacity haircut — the platform's calibrated value), then global routing with up to 30 congestion-negotiation iterations. The log's congestion table — per-layer resource/demand/overflow — is the report to read first when a design is too dense: nonzero overflow here predicts detailed-routing pain before hours are spent.
 
 ```tcl
 # -----------------------------------------------------------------------------
-# Post-route timing repair (then re-route the changed netlist); skipped in
-# routability-only runs
+# Post-route timing repair; skipped in routability-only runs
 # -----------------------------------------------------------------------------
 if {$::env(SEL_PNR_REPAIR) ne "0"} {
     estimate_parasitics -global_routing
@@ -68,7 +71,7 @@ if {$::env(SEL_PNR_REPAIR) ne "0"} {
     repair_timing -hold
     detailed_placement
 
-    global_route -congestion_iterations 30 -verbose
+    global_route {*}$GRT_ARGS
 }
 ```
 
@@ -78,36 +81,46 @@ Parasitics from the route guides, then the two repairs in the canonical order �
 # -----------------------------------------------------------------------------
 # Detailed routing
 # -----------------------------------------------------------------------------
-detailed_route \
-    -output_drc $REPORT_DIR/route_drc.rpt \
-    -verbose 1
+if {$::env(SEL_DROUTE_END_ITER) >= 0} {
+    detailed_route \
+        -output_drc $REPORT_DIR/route_drc.rpt \
+        -droute_end_iter $::env(SEL_DROUTE_END_ITER) \
+        -verbose 1
+} else {
+    detailed_route \
+        -output_drc $REPORT_DIR/route_drc.rpt \
+        -verbose 1
+}
 
 report_stage 4_route
 save_checkpoint 4_route
 ```
 
-TritonRoute consumes the guides and produces DRC-clean metal, iterating (`Completing X% with N violations` in the log — the count must reach 0). Layer limits are inherited from `set_routing_layers`. Remaining violations are written to `route_drc.rpt` with type, nets and coordinates — the file the flow treats as its pass/fail gate. Then the standard epilogue; this stage's `report_stage` shows the final flow timing (stage 5 re-measures with extracted parasitics).
+TritonRoute consumes the guides and produces DRC-clean metal, iterating (`Completing X% with N violations` in the log — the count must reach 0). Layer limits are inherited from `set_routing_layers`. Remaining violations are written to `route_drc.rpt` with type, nets and coordinates — the file the flow treats as its pass/fail gate. `DROUTE_END_ITER` caps the number of iterations (`-1`, the default, leaves the tool's own limit): the run then stops where it is, with the remaining violations in the report. Then the standard epilogue; this stage's `report_stage` shows the final flow timing (stage 5 re-measures with extracted parasitics).
 
 ## Design space
 
 - **The layer window** is a real design lever: shrinking it (e.g. M2–M5) models a cheaper metal stack or reserves layers for a parent design; widening (M8/M9) helps power-hungry global nets. Every window change re-prices congestion.
 - **Adjustment factor**: lower values pack the global plan tighter (risking detailed-route churn), higher values spread and lengthen wires. 0.2–0.35 is the usual band; raising it is the cheap knob when detailed routing struggles but overflow reads zero.
 - **Congestion iterations**: more negotiation helps marginal designs; a design needing many is telling you about density, not about the knob.
-- **`-allow_congestion`**: lets global routing hand an overflowing plan to detailed routing — occasionally useful for post-mortems, never for production runs.
+- **`-allow_congestion`** (`ALLOW_CONGESTION=1`): lets global routing hand an overflowing plan to detailed routing instead of stopping with `GRT-0116`. Off by default. It is meant for a design that misses by a handful of tiles, which the detailed router normally absorbs, and for post-mortems; with real congestion it only moves the failure into a much longer detailed-routing run.
+- **Iteration cap** (`DROUTE_END_ITER`): detailed routing has no resume, and its last iterations on a hard design can take hours for a handful of violations. Capping the iterations saves the layout as it stands, so wire length and occupation per layer can be read early; they barely move in the last iterations. The result is a time-boxed look, not a finished layout: `route_drc.rpt` is not empty.
 - **Antenna repair**: with a diode-equipped library, `repair_antennas` between global and detailed routing (plus a re-check after) is the standard insertion point.
 - **Post-route optimization**: a final `repair_timing` on *extracted* parasitics (stage-5 quality) is the next escalation commercial flows apply; this flow stops repair at guide-based parasitics.
 
 ## Knobs
 
-| Knob                  | Where           | Default | Effect / tradeoff                                                          |
-| --------------------- | --------------- | ------- | -------------------------------------------------------------------------- |
-| `MIN_ROUTE_LAYER`     | `init_tech.tcl` | M2      | Bottom of the signal layer window                                          |
-| `MAX_ROUTE_LAYER`     | make            | M7      | Top of the window: M5 when hardening a tile, M9 for a macro parent         |
-| `PNR_REPAIR`          | make            | 1       | `0` = no post-route repair and no re-route (routability-only run)          |
-| `MIN_CLK_LAYER`       | make            | M4      | Clock RC quality vs stealing upper-layer capacity; below `MAX_ROUTE_LAYER` |
-| layer adjustment      | `4_route.tcl`   | 0.25    | Global-plan safety margin: wirelength vs detailed-route convergence        |
-| congestion iterations | `4_route.tcl`   | 30      | Negotiation effort on marginal designs                                     |
-| `PNR_THREADS`         | make            | all     | Detailed routing dominates: threads ↔ runtime ↔ memory peak                |
+| Knob                  | Where           | Default | Effect / tradeoff                                                                     |
+| --------------------- | --------------- | ------- | ------------------------------------------------------------------------------------- |
+| `MIN_ROUTE_LAYER`     | `init_tech.tcl` | M2      | Bottom of the signal layer window                                                     |
+| `MAX_ROUTE_LAYER`     | make            | M7      | Top of the window: M5 when hardening a tile, M9 for a macro parent                    |
+| `PNR_REPAIR`          | make            | 1       | `0` = no post-route repair and no re-route (routability-only run)                     |
+| `MIN_CLK_LAYER`       | make            | M4      | Clock RC quality vs stealing upper-layer capacity; below `MAX_ROUTE_LAYER`            |
+| layer adjustment      | `4_route.tcl`   | 0.25    | Global-plan safety margin: wirelength vs detailed-route convergence                   |
+| congestion iterations | `4_route.tcl`   | 30      | Negotiation effort on marginal designs                                                |
+| `ALLOW_CONGESTION`    | make            | 0       | `1` = continue with residual global-route overflow instead of stopping                |
+| `DROUTE_END_ITER`     | make            | -1      | Stop after that many iterations and keep the partial layout; `-1` = run to completion |
+| `PNR_THREADS`         | make            | all     | Detailed routing dominates: threads ↔ runtime ↔ memory peak                           |
 
 ## Notes and caveats
 

@@ -122,6 +122,9 @@ The technology settings in one place: physical view paths, the placement site, p
 ```tcl
 if {$::env(SEL_PDN) ne "none"} {
     set PDN_CFG $::env(SEL_PDN)
+    if {[file pathtype $PDN_CFG] ne "absolute"} {
+        set PDN_CFG $::env(REPO_HOME)/$PDN_CFG
+    }
 } elseif {$::env(SEL_MACRO_DIRS) ne "none"} {
     set PDN_CFG $::env(REPO_HOME)/scripts/pnr/pdn_macro.tcl
 } else {
@@ -150,7 +153,7 @@ if {$::env(SEL_PNR_THREADS) > 0} {
 }
 ```
 
-PDN strategy selection (explicit override > macro-aware default > platform default), the optional project pin-constraint file (`PINS`, resolved like the floorplan file) with extra `place_pins` flags (`PIN_ARGS`), and the thread policy: all cores unless capped. The cap matters because detailed routing's memory peak scales with its parallel workers — `PNR_THREADS` is the flow's memory/runtime dial.
+PDN strategy selection (explicit override, taken from the repository root when the path is relative, > macro-aware default > platform default), the optional project pin-constraint file (`PINS`, resolved like the floorplan file) with extra `place_pins` flags (`PIN_ARGS`), and the thread policy: all cores unless capped. The cap matters because detailed routing's memory peak scales with its parallel workers — `PNR_THREADS` is the flow's memory/runtime dial.
 
 ### Checkpoints — `scripts/pnr/checkpoint.tcl`
 
@@ -167,10 +170,16 @@ proc load_checkpoint {tag} {
     source $::env(REPO_HOME)/scripts/pnr/setRC_extra.tcl
     source $::env(BEOL_HOME)/setRC.tcl
     set_dont_use $DONT_USE
+
+    if {$::env(SEL_CELL_PAD) > 0} {
+        set_placement_padding -global -right $::env(SEL_CELL_PAD)
+    }
 }
 ```
 
-The persistence contract in code: saving is just `write_db`; loading is `read_db` **plus the three context re-applications** — constraints ([02_constraints.md](../concepts/constraints.md)), wire RC estimates (`setRC_extra.tcl` first, for the layers stock ASAP7 lacks — M8/M9 — then the stack's own file, so a complete one overrides), and the optimizer blacklist — precisely the things ODB does not store. Keeping that knowledge in one proc is what makes six independent processes behave like one continuous session.
+The persistence contract in code: saving is just `write_db`; loading is `read_db` **plus the three context re-applications** — constraints ([02_constraints.md](../concepts/constraints.md)), wire RC estimates (`setRC_extra.tcl` first, for the layers stock ASAP7 lacks — M8/M9 — then the stack's own file, so a complete one overrides), and the optimizer blacklist — precisely the things ODB does not store. With `CELL_PAD` set, the placement padding joins them, so that every detailed placement of a stage sees it (global placement takes the same value through its own argument, see [07_pnr_place.md](07_pnr_place.md)). Keeping that knowledge in one proc is what makes six independent processes behave like one continuous session.
+
+Any database of a run opens in the OpenROAD GUI with `make open-odb OUT_DIR=<run> [ODB=<name>]`, where `ODB` is the file name under `output/` without its extension: `design` by default, or a stage checkpoint such as `2_place` or `4_route`.
 
 ### Reports — `scripts/pnr/reports.tcl`
 

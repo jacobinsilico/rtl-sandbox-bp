@@ -167,7 +167,7 @@ if {$::env(SEL_FLOORPLAN) ne "none"} {
 }
 ```
 
-The hierarchical hook: the project-owned `FLOORPLAN` file (one `place_macro -macro_name <inst> -location {x y} -orientation R0` per macro — *the* place where a component's position is decided) is sourced, then `cut_rows` removes the standard-cell rows under each macro and 1 µm of **halo** around it, so no cell can be legalized against the macro's edge and its pin access stays clear. Skipped entirely in flat runs. Details: [Hierarchical flow](../concepts/hierarchical.md); the shipped `example` project hardens `mac_n` inside `top_example` this way (see its README).
+The hierarchical hook: the project-owned `FLOORPLAN` file (one `place_macro -macro_name <inst> -location {x y} -orientation R0` per macro — *the* place where a component's position is decided) is sourced, then `cut_rows` removes the standard-cell rows under each macro and 1 µm of **halo** around it, so no cell can be legalized against the macro's edge and its pin access stays clear. Skipped entirely in flat runs. Details and the validated `top_dummy`+`dp_8` example: [18_hierarchical.md](../concepts/hierarchical.md).
 
 ```tcl
 # -----------------------------------------------------------------------------

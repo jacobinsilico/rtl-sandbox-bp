@@ -18,7 +18,11 @@ set_routing_layers \
     -signal $MIN_ROUTE_LAYER-$MAX_ROUTE_LAYER \
     -clock  $MIN_CLK_LAYER-$MAX_ROUTE_LAYER
 
-global_route -congestion_iterations 30 -verbose
+set GRT_ARGS {-congestion_iterations 30 -verbose}
+if {$::env(SEL_ALLOW_CONGESTION) ne "0"} {
+    lappend GRT_ARGS -allow_congestion
+}
+global_route {*}$GRT_ARGS
 
 # -----------------------------------------------------------------------------
 # Post-route timing repair; skipped in routability-only runs
@@ -29,7 +33,7 @@ if {$::env(SEL_PNR_REPAIR) ne "0"} {
     repair_timing -hold
     detailed_placement
 
-    global_route -congestion_iterations 30 -verbose
+    global_route {*}$GRT_ARGS
 }
 
 # -----------------------------------------------------------------------------

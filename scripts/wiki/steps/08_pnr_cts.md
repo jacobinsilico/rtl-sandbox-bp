@@ -42,18 +42,22 @@ Standard prologue, placed design in.
 
 ```tcl
 # -----------------------------------------------------------------------------
-# Clock tree synthesis (skipped for clockless designs)
+# Clock tree synthesis
 # -----------------------------------------------------------------------------
 if {[llength [get_ports -quiet clk_i]] > 0} {
     repair_clock_inverters
-    clock_tree_synthesis -sink_clustering_enable -repair_clock_nets
+    if {$::env(SEL_MACRO_DIRS) ne "none"} {
+        clock_tree_synthesis -repair_clock_nets
+    } else {
+        clock_tree_synthesis -sink_clustering_enable -repair_clock_nets
+    }
     set_propagated_clock [all_clocks]
 }
 ```
 
 The guard mirrors the constraint scheme's convention: no `clk_i` port → a combinational block → no tree to build (essential for hardening combinational hard macros — the stage degrades to a legalization/report pass instead of erroring).
 
-Inside: `repair_clock_inverters` normalizes inverter pairs on the clock path so the tree builder sees clean polarity. `clock_tree_synthesis` builds the tree — `-sink_clustering_enable` groups nearby sinks under shared leaf buffers (smaller, lower-power trees), `-repair_clock_nets` fixes long root connections while building. No explicit buffer list is passed: the tool selects from the loaded liberty, and the `set_dont_use` blacklist (no fractional drives, no ICG insertion) bounds its choices. Then the switch: `set_propagated_clock [all_clocks]` — from here to the end of the flow, real arrival times. (The virtual clock, having no pins, is unaffected; the tool notes it with a benign warning.)
+Inside: `repair_clock_inverters` normalizes inverter pairs on the clock path so the tree builder sees clean polarity. `clock_tree_synthesis` builds the tree — `-sink_clustering_enable` groups nearby sinks under shared leaf buffers (smaller, lower-power trees), `-repair_clock_nets` fixes long root connections while building. A macro parent (`MACRO_DIRS`) builds its tree without sink clustering. No explicit buffer list is passed: the tool selects from the loaded liberty, and the `set_dont_use` blacklist (no fractional drives, no ICG insertion) bounds its choices. Then the switch: `set_propagated_clock [all_clocks]` — from here to the end of the flow, real arrival times. (The virtual clock, having no pins, is unaffected; the tool notes it with a benign warning.)
 
 ```tcl
 # -----------------------------------------------------------------------------
@@ -91,12 +95,12 @@ The tree's buffers and repair's cells are legalized into the rows, the invariant
 
 ## Knobs
 
-| Knob                 | Where           | Default       | Effect / tradeoff                                            |
-| -------------------- | --------------- | ------------- | ------------------------------------------------------------ |
-| `CLK_UNCERTAINTY_PS` | make            | 0             | Margin available to CTS-era setup repair                     |
-| `MIN_CLK_LAYER`      | make            | M4            | Clock wires' lowest layer — RC quality of the tree's routing |
-| CTS options          | `3_cts.tcl`     | clustering on | Tree size/power vs skew fine-tuning (`-buf_list`, targets)   |
-| `PNR_REPAIR`         | make            | 1             | `0` = no setup repair after the tree (routability-only run)  |
+| Knob                 | Where       | Default       | Effect / tradeoff                                            |
+| -------------------- | ----------- | ------------- | ------------------------------------------------------------ |
+| `CLK_UNCERTAINTY_PS` | make        | 0             | Margin available to CTS-era setup repair                     |
+| `MIN_CLK_LAYER`      | make        | M4            | Clock wires' lowest layer — RC quality of the tree's routing |
+| CTS options          | `3_cts.tcl` | clustering on | Tree size/power vs skew fine-tuning (`-buf_list`, targets)   |
+| `PNR_REPAIR`         | make        | 1             | `0` = no setup repair after the tree (routability-only run)  |
 
 ## Notes and caveats
 

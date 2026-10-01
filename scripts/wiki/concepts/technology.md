@@ -49,16 +49,16 @@ The same MACRO format describes big hard macros (memories — or the blocks this
 
 The standard cells draw their pins and internal wiring on M1 and M2 and nowhere else, so everything above M2 can be replaced without touching a cell. `BEOL=smic-n3` does exactly that: it keeps ASAP7's cells, M1 and M2, and takes from M3 up the metal pitches measured on SMIC N+3, with widths at half the pitch.
 
-| Layers     | ASAP7 pitch (nm) | `smic-n3` pitch (nm) | Rule style in the tech LEF                     |
-| ---------- | ---------------- | -------------------- | ---------------------------------------------- |
-| M1, M2     | 36               | 36                   | ASAP7's, frozen by the cells                   |
-| M3         | 36               | 44                   | ASAP7's fine-layer rules, scaled               |
-| M4, M5     | 48               | 80                   | Classic rules of ASAP7's M8                    |
-| M6         | 64               | 80                   | Classic rules of ASAP7's M8                    |
-| M7         | 64               | 128                  | The same, scaled                               |
-| M8, M9     | 80               | 128                  | The same, scaled                               |
-| M10        | —                | 128                  | The same, scaled                               |
-| M11        | —                | 148                  | The same, scaled; carries nothing in this flow |
+| Layers | ASAP7 pitch (nm) | `smic-n3` pitch (nm) | Rule style in the tech LEF                     |
+| ------ | ---------------- | -------------------- | ---------------------------------------------- |
+| M1, M2 | 36               | 36                   | ASAP7's, frozen by the cells                   |
+| M3     | 36               | 44                   | ASAP7's fine-layer rules, scaled               |
+| M4, M5 | 48               | 80                   | Classic rules of ASAP7's M8                    |
+| M6     | 64               | 80                   | Classic rules of ASAP7's M8                    |
+| M7     | 64               | 128                  | The same, scaled                               |
+| M8, M9 | 80               | 128                  | The same, scaled                               |
+| M10    | —                | 128                  | The same, scaled                               |
+| M11    | —                | 148                  | The same, scaled; carries nothing in this flow |
 
 Every layer above M2 is wider and coarser than ASAP7's: fewer, fatter wires. A design on this stack therefore shows more congestion without necessarily showing worse wire delay. Its wire RC and extraction tables are ASAP7's rescaled with the wire width, not characterised data, so timing on it compares designs against each other correctly but is not an absolute prediction. The first coarse layer is M4 instead of M5, which moves the hierarchical recipes one layer down ([hierarchical](hierarchical.md)). The stack lives in the platform repository, which documents how each of its files was derived.
 

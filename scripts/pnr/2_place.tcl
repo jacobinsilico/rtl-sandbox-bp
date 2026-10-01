@@ -19,10 +19,14 @@ repair_tie_fanout -separation 0 $TIELO_PORT
 # -----------------------------------------------------------------------------
 # Global placement & final pin placement
 # -----------------------------------------------------------------------------
-global_placement \
-    -density $::env(SEL_PLACE_DENSITY) \
-    -routability_driven \
-    -timing_driven
+set GPL_ARGS [list -density $::env(SEL_PLACE_DENSITY) \
+                   -pad_right $::env(SEL_CELL_PAD) \
+                   -routability_driven \
+                   -timing_driven]
+if {$::env(SEL_INIT_DENSITY_PENALTY) ne "none"} {
+    lappend GPL_ARGS -init_density_penalty $::env(SEL_INIT_DENSITY_PENALTY)
+}
+global_placement {*}$GPL_ARGS
 
 set_pin_length -hor_length 0.24 -ver_length 0.24
 place_pins -hor_layers $PIN_LAYER_HOR -ver_layers $PIN_LAYER_VER {*}$PIN_ARGS

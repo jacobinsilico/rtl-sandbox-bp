@@ -32,7 +32,7 @@ Two structural consequences of simulating a netlist:
 ```bash
 verilator \
     -sv \
-    --build-jobs 0 \
+    --build-jobs "${SEL_BUILD_JOBS}" \
     --binary \
     --timing \
     --output-split 20000 \
@@ -62,6 +62,7 @@ verilator \
 - The extra `-Wno-*` waivers exist because PDK cell models are not lint-clean code (`SPECIFYIGN`: Verilator ignores `specify` timing blocks — expected in zero-delay GLS; the rest silence style noise from the vendor models).
 - `--x-initial fast --x-assign fast` — Verilator's pragmatic 2-state answer to netlist X-semantics: uninitialized state resolves quickly to deterministic values rather than pessimistic X. Cheap and repeatable; *not* an X-propagation analysis.
 - `--output-split 20000` — netlists produce one huge module; splitting the generated C++ keeps compiler memory in check.
+- With `VCD=1` the tracing flags gain `--trace-underscore`: synthesis names most nets of a netlist with a leading underscore, which Verilator leaves out of a dump by default, and power analysis needs every net.
 
 The file list, `scripts/post-syn-sim/filelist.f`:
 

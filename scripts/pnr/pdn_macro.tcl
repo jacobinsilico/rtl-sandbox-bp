@@ -3,12 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # -----------------------------------------------------------------------------
 #
-# Macro-aware PDN. Blocks hardened by this flow are routed up to M5 (M6+M7 left
-# free, see MAX_ROUTE_LAYER + pdn_tile.tcl) and expose their power straps as M5
-# pins. The standard-cell grid runs M1/M2 rails + an M5 mesh in the loose-logic
+# Macro-aware PDN. Blocks hardened by this flow are routed up to M5 (M6 and above
+# left free, see MAX_ROUTE_LAYER + pdn_tile.tcl) and expose their power straps as
+# M5 pins. The standard-cell grid runs M1/M2 rails + an M5 mesh in the loose-logic
 # areas; an M6 mesh runs over the whole core - including the macros, since M6 is
-# free - and drops onto each macro's M5 power pins. M7 carries no power and is
-# left entirely for the parent to route over the macros.
+# free - and drops onto each macro's M5 power pins.
+#
+# Above it a global mesh on M7, M8 and M9 carries the current across the die and
+# exposes the M9 straps as the design's power pins. Its pitch is four times the
+# M5/M6 one. Consecutive layers are perpendicular, so every crossing takes a
+# single via level; the vertical layers share their column with the M5 straps
+# and M8 shares its row with M6.
 # This is the file for the stock ASAP7 stack; BEOL=smic-n3 takes pdn_macro_smic-n3.tcl.
 # -----------------------------------------------------------------------------
 
@@ -28,16 +33,22 @@ global_connect
 set_voltage_domain -name {CORE} -power {VDD} -ground {VSS}
 
 # -----------------------------------------------------------------------------
-# Standard cell grid (M1/M2 rails, M5 mesh, M6 top mesh over the whole core)
+# Standard cell grid (M1/M2 rails, M5/M6 mesh over the whole core, M7-M9 global)
 # -----------------------------------------------------------------------------
-define_pdn_grid -name {top} -voltage_domains {CORE} -pins {M6}
+define_pdn_grid -name {top} -voltage_domains {CORE} -pins {M9}
 add_pdn_stripe -grid {top} -layer {M1} -width {0.018} -pitch {0.54} -offset {0} -followpins
 add_pdn_stripe -grid {top} -layer {M2} -width {0.018} -pitch {0.54} -offset {0} -followpins
 add_pdn_stripe -grid {top} -layer {M5} -width {0.12}  -spacing {0.072} -pitch {5.4} -offset {0.300}
-add_pdn_stripe -grid {top} -layer {M6} -width {0.288} -spacing {0.096} -pitch {5.4} -offset {0.513}
+add_pdn_stripe -grid {top} -layer {M6} -width {0.288} -spacing {0.096} -pitch {5.4}  -offset {0.513}
+add_pdn_stripe -grid {top} -layer {M7} -width {0.288} -spacing {0.096} -pitch {21.6} -offset {0.300}
+add_pdn_stripe -grid {top} -layer {M8} -width {0.48}  -spacing {0.160} -pitch {21.6} -offset {0.513}
+add_pdn_stripe -grid {top} -layer {M9} -width {0.48}  -spacing {0.160} -pitch {21.6} -offset {0.300}
 add_pdn_connect -grid {top} -layers {M1 M2}
 add_pdn_connect -grid {top} -layers {M2 M5}
 add_pdn_connect -grid {top} -layers {M5 M6}
+add_pdn_connect -grid {top} -layers {M6 M7}
+add_pdn_connect -grid {top} -layers {M7 M8}
+add_pdn_connect -grid {top} -layers {M8 M9}
 
 # -----------------------------------------------------------------------------
 # Macro grid (drop the parent M6 straps onto each macro's M5 power pins)

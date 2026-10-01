@@ -52,18 +52,20 @@ repair_tie_fanout -separation 0 $TIELO_PORT
 # -----------------------------------------------------------------------------
 # Global placement & final pin placement
 # -----------------------------------------------------------------------------
-global_placement \
-    -density $::env(SEL_PLACE_DENSITY) \
-    -routability_driven \
-    -timing_driven
+set GPL_ARGS [list -density $::env(SEL_PLACE_DENSITY) \
+                   -pad_right $::env(SEL_CELL_PAD) \
+                   -routability_driven \
+                   -timing_driven]
+if {$::env(SEL_INIT_DENSITY_PENALTY) ne "none"} {
+    lappend GPL_ARGS -init_density_penalty $::env(SEL_INIT_DENSITY_PENALTY)
+}
+global_placement {*}$GPL_ARGS
 
 set_pin_length -hor_length 0.24 -ver_length 0.24
-# The PINS constraints set at floorplan persist in the ODB checkpoint and are
-# reloaded with it; sourcing the file again would duplicate every pin group.
 place_pins -hor_layers $PIN_LAYER_HOR -ver_layers $PIN_LAYER_VER {*}$PIN_ARGS
 ```
 
-Global placement with both refinement modes on and the density target from the make level (default 0.60 — the platform's recommended value: 60 % maximum local occupancy). Then the **final** pin placement: the floorplan's pin pass ran before any cell had a position; now, with the placement known, `place_pins` re-optimizes every port's boundary position against where its loads actually are (pin geometry settings are per-process, hence repeated; the `PINS` constraints are not — they live in the database and re-sourcing them makes every pin a member of two groups, which the placer rejects).
+Global placement with both refinement modes on and the density target from the make level (default 0.60 — the platform's recommended value: 60 % maximum local occupancy). The arguments are built as a list because two of them are optional: the cell padding (`CELL_PAD`, zero by default) and the solver's initial density penalty, which is passed only when `INIT_DENSITY_PENALTY` is set. Then the **final** pin placement: the floorplan's pin pass ran before any cell had a position; now, with the placement known, `place_pins` re-optimizes every port's boundary position against where its loads actually are (pin geometry settings are per-process, hence repeated; the `PINS` constraints are not — they live in the database and re-sourcing them makes every pin a member of two groups, which the placer rejects).
 
 ```tcl
 # -----------------------------------------------------------------------------
@@ -93,7 +95,9 @@ Legalization of everything — including the cells repair just created — follo
 
 ## Design space
 
+- **Padding** (`CELL_PAD`, passed to `global_placement` as `-pad_right` and set in `checkpoint.tcl` for every detailed placement, since the two do not share it) keeps empty sites beside every cell. It is the knob for the failure mode where detailed routing stalls on M2 end-of-line, shorts and M3 spacing between neighbouring cells: the gaps give the router access tracks. One site adds about 19 percent to the placed area of an average ASAP7 cell, so the density target must be at least the utilization times 1.19.
 - **Density** is the primary placement knob. Lowering it (toward the floorplan utilization) spreads cells: better routability, longer wires; raising it clusters: shorter wires until congestion bites. The classic congestion ladder is `PLACE_DENSITY` down → `CORE_UTIL` down → floorplan rework.
+- **Initial density penalty** (`INIT_DENSITY_PENALTY`, passed as `-init_density_penalty`): the starting weight of the density term in the placer's cost function, 8e-5 in the tool. It moves the path of the optimisation, not its target, so it changes no area, density or constraint. It is the knob for a global placement that diverges in its routability loop and stops: a slightly larger value steers the solver around the divergence.
 - **Mode selection**: `-timing_driven`/`-routability_driven` cost runtime (internal STA and trial routing per iteration) and are worth it for anything beyond trivial blocks. Skew-aware and cluster-guided variants exist upstream for special structures.
 - **Cell padding** (`set_placement_padding`) reserves empty sites next to selected cells — a pre-emptive congestion/ECO-space tool this flow doesn't need yet.
 - **Incremental placement**: re-legalizing after small netlist edits instead of re-running global placement — the pattern later stages use when their repairs add cells.
@@ -101,12 +105,14 @@ Legalization of everything — including the cells repair just created — follo
 
 ## Knobs
 
-| Knob            | Where         | Default | Effect / tradeoff                                                        |
-| --------------- | ------------- | ------- | ------------------------------------------------------------------------ |
-| `PLACE_DENSITY` | make          | 0.60    | Local packing; ↓ = routability, ↑ = shorter wires until congestion       |
-| pin length      | `2_place.tcl` | 0.24 µm | Boundary pin depth (kept identical to the floorplan pass)                |
-| repair limits   | tool defaults | liberty | `repair_design` honors liberty max-slew/cap/fanout — implicit knobs      |
-| `PNR_REPAIR`    | make          | 1       | `0` = skip design repair here and timing repair later (routability-only) |
+| Knob                   | Where         | Default | Effect / tradeoff                                                                               |
+| ---------------------- | ------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `PLACE_DENSITY`        | make          | 0.60    | Local packing; ↓ = routability, ↑ = shorter wires until congestion                              |
+| `CELL_PAD`             | make          | 0       | Sites kept free beside every cell; `1` for pin-access congestion, raise the density to cover it |
+| `INIT_DENSITY_PENALTY` | make          | none    | Starting weight of the density term; raise it slightly when global placement diverges           |
+| pin length             | `2_place.tcl` | 0.24 µm | Boundary pin depth (kept identical to the floorplan pass)                                       |
+| repair limits          | tool defaults | liberty | `repair_design` honors liberty max-slew/cap/fanout — implicit knobs                             |
+| `PNR_REPAIR`           | make          | 1       | `0` = skip design repair here and timing repair later (routability-only)                        |
 
 ## Notes and caveats
 

@@ -27,10 +27,11 @@ Every tunable of the flow in one place: the make-level parameters, the script-le
 
 ## Simulation
 
-| Knob     | Steps         | Default | Effect                                                          | Doc                      |
-| -------- | ------------- | ------- | --------------------------------------------------------------- | ------------------------ |
-| `PARAMS` | sim, syn, GLS | none    | Elaboration parameters — the design-size dial                   | [00](../steps/00_sim.md) |
-| `VCD`    | sims          | 0       | Activity dump. ↑runtime, large files; required by the dpa steps | [00](../steps/00_sim.md) |
+| Knob         | Steps         | Default | Effect                                                                                                                                                  | Doc                      |
+| ------------ | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| `PARAMS`     | sim, syn, GLS | none    | Elaboration parameters — the design-size dial                                                                                                           | [00](../steps/00_sim.md) |
+| `VCD`        | sims          | 0       | Activity dump. ↑runtime, large files; required by the dpa steps                                                                                         | [00](../steps/00_sim.md) |
+| `BUILD_JOBS` | make          | 0       | Verilator compile jobs; `0` = every core. A gate-level netlist of a few hundred thousand cells can exhaust the memory with that many parallel compilers | [00](../steps/00_sim.md) |
 
 ## Synthesis
 
@@ -59,11 +60,13 @@ Every tunable of the flow in one place: the make-level parameters, the script-le
 
 ## Placement
 
-| Knob            | Level   | Default                   | Effect                                                                                                        | Doc                            |
-| --------------- | ------- | ------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| `PLACE_DENSITY` | make    | 0.60                      | Local packing limit. ↓ = routability, ↑ = shorter wires until congestion. First knob of the congestion ladder | [07](../steps/07_pnr_place.md) |
-| placement modes | script  | routability+timing driven | Runtime ↔ QoR refinements of global placement                                                                 | [07](../steps/07_pnr_place.md) |
-| repair limits   | liberty | max slew/cap/fanout       | Implicit electrical rules `repair_design` enforces                                                            | [07](../steps/07_pnr_place.md) |
+| Knob                   | Level   | Default                   | Effect                                                                                                                                                                                                                    | Doc                            |
+| ---------------------- | ------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| `PLACE_DENSITY`        | make    | 0.60                      | Local packing limit. ↓ = routability, ↑ = shorter wires until congestion. First knob of the congestion ladder                                                                                                             | [07](../steps/07_pnr_place.md) |
+| `CELL_PAD`             | make    | 0                         | Sites kept free beside every cell in global and detailed placement. `1` spreads cells for pin access where routing stalls on M2/M3 spacing and shorts; padded cells count toward `PLACE_DENSITY`, so raise it accordingly | [07](../steps/07_pnr_place.md) |
+| `INIT_DENSITY_PENALTY` | make    | none (tool default)       | Starting weight of the density term in global placement. A solver knob: it moves the path, not the target. Raise it slightly (the tool starts at 8e-5) when global placement diverges                                     | [07](../steps/07_pnr_place.md) |
+| placement modes        | script  | routability+timing driven | Runtime ↔ QoR refinements of global placement                                                                                                                                                                             | [07](../steps/07_pnr_place.md) |
+| repair limits          | liberty | max slew/cap/fanout       | Implicit electrical rules `repair_design` enforces                                                                                                                                                                        | [07](../steps/07_pnr_place.md) |
 
 ## Clock tree
 
@@ -75,14 +78,16 @@ Every tunable of the flow in one place: the make-level parameters, the script-le
 
 ## Routing
 
-| Knob                  | Level  | Default | Effect                                                                                                                            | Doc                                                               |
-| --------------------- | ------ | ------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `MIN_ROUTE_LAYER`     | script | M2      | Bottom of the signal layer window                                                                                                 | [09](../steps/09_pnr_route.md)                                    |
-| `MAX_ROUTE_LAYER`     | make   | M7      | Top of the window: M5 when hardening a tile, M9 for a macro parent (RC from `setRC_extra.tcl`); M4 and M10 on the `smic-n3` stack | [09](../steps/09_pnr_route.md)                                    |
-| `PNR_REPAIR`          | make   | 1       | `0` = routability-only run: no design/timing repair, single global route, unbuffered netlist                                      | [07](../steps/07_pnr_place.md), [09](../steps/09_pnr_route.md)    |
-| layer adjustment      | script | 0.25    | Global-plan capacity haircut. ↑ = safer detailed routing, longer wires                                                            | [09](../steps/09_pnr_route.md)                                    |
-| congestion iterations | script | 30      | Negotiation effort on marginal designs                                                                                            | [09](../steps/09_pnr_route.md)                                    |
-| `PNR_THREADS`         | make   | 0 (all) | Parallelism. ↑ = faster routing, higher memory peak — the memory relief valve is lowering it                                      | [05](../steps/05_pnr_overview.md), [09](../steps/09_pnr_route.md) |
+| Knob                  | Level  | Default     | Effect                                                                                                                                                                  | Doc                                                               |
+| --------------------- | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `MIN_ROUTE_LAYER`     | script | M2          | Bottom of the signal layer window                                                                                                                                       | [09](../steps/09_pnr_route.md)                                    |
+| `MAX_ROUTE_LAYER`     | make   | M7          | Top of the window: M5 when hardening a tile, M9 for a macro parent (RC from `setRC_extra.tcl`); M4 and M10 on the `smic-n3` stack                                       | [09](../steps/09_pnr_route.md)                                    |
+| `PNR_REPAIR`          | make   | 1           | `0` = routability-only run: no design/timing repair, single global route, unbuffered netlist                                                                            | [07](../steps/07_pnr_place.md), [09](../steps/09_pnr_route.md)    |
+| layer adjustment      | script | 0.25        | Global-plan capacity haircut. ↑ = safer detailed routing, longer wires                                                                                                  | [09](../steps/09_pnr_route.md)                                    |
+| congestion iterations | script | 30          | Negotiation effort on marginal designs                                                                                                                                  | [09](../steps/09_pnr_route.md)                                    |
+| `ALLOW_CONGESTION`    | make   | 0           | `1` = hand a global plan with residual overflow to detailed routing instead of stopping. For a design that misses by a few tiles, not a cure for real congestion        | [09](../steps/09_pnr_route.md)                                    |
+| `DROUTE_END_ITER`     | make   | -1 (no cap) | Stops detailed routing after that many iterations and saves the layout as it stands, violations included. For a time-boxed look at a hard design, not a finished layout | [09](../steps/09_pnr_route.md)                                    |
+| `PNR_THREADS`         | make   | 0 (all)     | Parallelism. ↑ = faster routing, higher memory peak — the memory relief valve is lowering it                                                                            | [05](../steps/05_pnr_overview.md), [09](../steps/09_pnr_route.md) |
 
 ## Finishing and outputs
 

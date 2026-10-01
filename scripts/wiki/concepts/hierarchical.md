@@ -37,7 +37,7 @@ The hooks, in pipeline order — each quoted from its home script.
 ```tcl
 if {$env(SEL_LINK_BLACKBOXES) ne "0"} {
     foreach mod $blackbox_modules {
-        yosys "read_verilog $imp_dir/$mod/output/netlist.v"
+        yosys "read_verilog [bb_netlist $imp_dir $mod]"
     }
 }
 ```
@@ -55,6 +55,9 @@ if {$::env(SEL_MACRO_DIRS) ne "none"} {
 ```tcl
 if {$::env(SEL_PDN) ne "none"} {
     set PDN_CFG $::env(SEL_PDN)
+    if {[file pathtype $PDN_CFG] ne "absolute"} {
+        set PDN_CFG $::env(REPO_HOME)/$PDN_CFG
+    }
 } elseif {$::env(SEL_MACRO_DIRS) ne "none"} {
     set PDN_CFG $::env(REPO_HOME)/scripts/pnr/pdn_macro.tcl
 } else {
@@ -98,7 +101,7 @@ define_pdn_grid -name {MacroGrid} -voltage_domains {CORE} -macro -default -halo 
 add_pdn_connect -grid {MacroGrid} -layers {M5 M6}
 ```
 
-(The platform's default strategy instead assumes SRAM-style M4 pins — its macro grid finds no shapes on our blocks and `pdngen` aborts; the layer pair must match what the block actually exports. The rest of `pdn_macro.tcl` is the standard grid of [06_pnr_floorplan.md](../steps/06_pnr_floorplan.md) with the M6 mesh extended over the macros; M7 and above carry no power, so the parent routes over the tiles on M7, or on M7–M9 with `MAX_ROUTE_LAYER=M9`.)
+(The platform's default strategy instead assumes SRAM-style M4 pins — its macro grid finds no shapes on our blocks and `pdngen` aborts; the layer pair must match what the block actually exports. The rest of `pdn_macro.tcl` is the standard grid of [06_pnr_floorplan.md](../steps/06_pnr_floorplan.md) with the M6 mesh extended over the macros, plus a coarse global mesh on M7–M9 at four times the M5/M6 pitch, whose M9 straps are the parent's own power pins. Its widths are the widest the rules allow cheaply: 0.288 µm is a legal entry of the M7 width table, and 0.48 µm stays just under the width at which the M8/M9 spacing rule jumps from 0.04 to 0.5 µm. Consecutive layers are perpendicular, so each pair connects with a single via level; the mesh costs about 4 % of the M7 tracks and 6 % of the M8/M9 ones, which the parent still routes over the tiles.)
 
 **On the `smic-n3` stack** (`BEOL=smic-n3`) the same scheme sits one layer lower, because the first coarse layer there is M4 rather than M5. A block is hardened with `MAX_ROUTE_LAYER=M4`, `MIN_CLK_LAYER=M3`, `PIN_LAYERS_VER=M3` and `pdn_tile_smic-n3.tcl`: rails on M1/M2, vertical M3 straps tying the rails together, and a horizontal M4 mesh exported as the PG pins. The M3 straps exist because M4 runs parallel to the rails and cannot tie them by itself; on ASAP7 the vertical M5 straps do both jobs. The parent takes `pdn_macro_smic-n3.tcl`, whose vertical M5 straps are free to run over the macros and are dropped onto the M4 pins with `add_pdn_connect -layers {M4 M5}`, and it may route up to M10. The default macro PDN is the ASAP7 one, so on this stack `PDN` must be given explicitly; with the wrong file the macro grid finds no shapes and `pdngen` aborts, as above.
 

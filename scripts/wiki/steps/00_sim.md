@@ -74,7 +74,7 @@ Tracing is opt-in. `--trace` compiles VCD instrumentation in; the two `-max` opt
 ```bash
 verilator \
     -sv \
-    --build-jobs 0 \
+    --build-jobs "${SEL_BUILD_JOBS}" \
     --binary \
     --timing \
     "${trace_flags[@]}" \

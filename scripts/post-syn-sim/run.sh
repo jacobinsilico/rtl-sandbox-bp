@@ -29,7 +29,7 @@ fi
 
 verilator \
     -sv \
-    --build-jobs 0 \
+    --build-jobs "${SEL_BUILD_JOBS}" \
     --binary \
     --timing \
     --output-split 20000 \

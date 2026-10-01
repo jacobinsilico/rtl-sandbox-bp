@@ -99,11 +99,17 @@ The single elaboration call: `-G` overrides top-level parameters; `--keep-hierar
 ```tcl
 set imp_dir "$env(REPO_HOME)/projects/$env(SEL_PROJECT)/imp"
 
-foreach mod $blackbox_modules {
-    set netlist "$imp_dir/$mod/output/netlist.v"
-    if {![file exists $netlist]} {
-        error "BLACKBOX_MODULES: $netlist not found - run 'make syn PROJECT=$env(SEL_PROJECT) TOP_LEVEL=$mod OUT_DIR=$mod' first"
+# Resolve a blackboxed module's netlist: prefer imp/<mod>_syn/, fall back to imp/<mod>/
+proc bb_netlist {imp_dir mod} {
+    foreach dir [list ${mod}_syn $mod] {
+        set f "$imp_dir/$dir/output/netlist.v"
+        if {[file exists $f]} { return $f }
     }
+    error "BLACKBOX_MODULES: netlist for '$mod' not found (looked in imp/${mod}_syn/ and imp/$mod/) - synthesize it first"
+}
+
+foreach mod $blackbox_modules {
+    set netlist [bb_netlist $imp_dir $mod]
 
     set params_file "$imp_dir/$env(SEL_OUT_DIR)/output/${mod}_params.txt"
     yosys "dump -o $params_file t:$mod"
@@ -129,7 +135,7 @@ foreach mod $blackbox_modules {
 }
 ```
 
-Blackbox *linking*, part one. Each blackboxed module's previously synthesized netlist must exist (two-pass discipline: components first). The parameter dance strips residual parameters from the stub instances (a stub carries the RTL's parameter list; the synthesized netlist has none — they must match before binding). The netlist is then read as an interface (`-lib`) and the boundary is pinned with `keep_hierarchy` so nothing dissolves it.
+Blackbox *linking*, part one. Each blackboxed module's previously synthesized netlist must exist (two-pass discipline: components first); `bb_netlist` looks for it in `imp/<mod>_syn/` and then in `imp/<mod>/`. The parameter dance strips residual parameters from the stub instances (a stub carries the RTL's parameter list; the synthesized netlist has none — they must match before binding). The netlist is then read as an interface (`-lib`) and the boundary is pinned with `keep_hierarchy` so nothing dissolves it.
 
 ```tcl
 set keep_modules {}
@@ -225,7 +231,7 @@ dnsize -c
 ```tcl
 if {$env(SEL_LINK_BLACKBOXES) ne "0"} {
     foreach mod $blackbox_modules {
-        yosys "read_verilog $imp_dir/$mod/output/netlist.v"
+        yosys "read_verilog [bb_netlist $imp_dir $mod]"
     }
 }
 ```
