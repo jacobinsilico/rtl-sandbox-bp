@@ -306,6 +306,18 @@ module tb_bp_gshare_core #(
         end
         $fclose(fd);
 
+        // Drain: the last update may still be completing (its write-back
+        // happens after the update handshake). Wait until the core is idle,
+        // so the counters include every access of every branch.
+        begin
+            int unsigned waited;
+            waited = 0;
+            while (!pred_req_ready) begin
+                step;   // the counters sample this edge before step returns
+                if (++waited > TIMEOUT_CYCLES) fail("timeout waiting for the core to drain");
+            end
+        end
+
 `ifdef VCD
         $dumpoff;
 `endif

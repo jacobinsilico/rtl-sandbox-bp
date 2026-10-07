@@ -15,23 +15,31 @@
 //   (gshare.h FoldHistory); for GHR_BITS <= INDEX_BITS it is the GHR itself.
 //   Prediction = MSB of the counter (counter > 1 for 2 bits, as gshare.h).
 //
+//   State kept between predict and update (project-wide rule): the computed
+//   index and small decision values live in flops; table contents are
+//   re-read from the SRAM at update time. For gshare: idx_q in flops, the
+//   counter re-read.
+//
 //   Protocol (stage 1: non-speculative, ONE branch in flight, as the CBP5
 //   harness calls GetPrediction and UpdatePredictor back to back):
 //     S_IDLE     - pred_req_ready_o = 1. A predict handshake reads the PHT at
 //                  idx and latches idx. An UNCONDITIONAL update
 //                  (upd_is_cond_i = 0, CBP5 TrackOtherInst) is also accepted
 //                  here; gshare ignores it, as gshare.h does.
-//     S_READ     - SRAM data is valid: pred_resp_valid_o = 1 for one cycle,
-//                  pred_resp_taken_o is the prediction. The counter value is
-//                  latched for the update.
+//     S_PRED     - the read data is valid: pred_resp_valid_o = 1 for one
+//                  cycle, pred_resp_taken_o is the prediction.
 //     S_WAIT_UPD - waits for the CONDITIONAL update (upd_is_cond_i = 1) of
-//                  the same branch: writes the saturated counter back to the
-//                  latched idx and shifts the resolved direction into the GHR.
+//                  the same branch. Its handshake re-reads the PHT at idx_q
+//                  and latches the resolved direction.
+//     S_UPD      - the re-read counter is valid: the saturated counter is
+//                  written back to idx_q and the resolved direction is
+//                  shifted into the GHR.
+//   A conditional branch takes 4 cycles (2 PHT reads, 1 PHT write); an
+//   unconditional one takes 1.
 //
-//   Read-modify-write without a second read: the counter read at predict
-//   time is reused at update time. This equals gshare.h's re-read, because
-//   with one branch in flight nothing can write that entry in between, and
-//   the GHR (hence the index) only changes at the end of the update.
+//   The re-read returns what gshare.h reads in UpdatePredictor: with one
+//   branch in flight nothing writes that entry in between, and the GHR (hence
+//   the index) only changes at the end of the update.
 //
 //   Not modeled (stage 1): speculative history update, a PHT init FSM (the
 //   SRAM model starts at weakly taken, as gshare.h's constructor), skipping
@@ -106,14 +114,15 @@ module bp_gshare_core #(
     // -------------------------------------------------------------------------
     typedef enum logic [1:0] {
         S_IDLE     = 2'd0,
-        S_READ     = 2'd1,
-        S_WAIT_UPD = 2'd2
+        S_PRED     = 2'd1,
+        S_WAIT_UPD = 2'd2,
+        S_UPD      = 2'd3
     } state_e;
 
     state_e                state_q, state_d;
-    logic [  GHR_BITS-1:0] ghr_q;   // global history, newest outcome in bit 0
-    logic [INDEX_BITS-1:0] idx_q;   // PHT index of the branch in flight
-    logic [  CTR_BITS-1:0] ctr_q;   // its counter, as read at predict time
+    logic [  GHR_BITS-1:0] ghr_q;     // global history, newest outcome in bit 0
+    logic [INDEX_BITS-1:0] idx_q;     // PHT index of the branch in flight
+    logic                  taken_q;   // its resolved direction
 
     // -------------------------------------------------------------------------
     // Index: inline history fold (gshare.h FoldHistory) XOR shifted PC
@@ -139,7 +148,7 @@ module bp_gshare_core #(
     logic upd_cond_fire;   // conditional update accepted
 
     assign pred_req_ready_o  = (state_q == S_IDLE);
-    assign pred_resp_valid_o = (state_q == S_READ);
+    assign pred_resp_valid_o = (state_q == S_PRED);
     assign pred_resp_taken_o = pht_rdata_i[CTR_BITS-1];
     assign upd_ready_o       = (state_q == S_IDLE) || (state_q == S_WAIT_UPD);
 
@@ -147,19 +156,19 @@ module bp_gshare_core #(
     assign upd_cond_fire = upd_valid_i && upd_is_cond_i && (state_q == S_WAIT_UPD);
 
     // -------------------------------------------------------------------------
-    // PHT access
+    // PHT access: read at predict and again at update, write after the re-read
     // -------------------------------------------------------------------------
-    assign pht_re_o    = pred_fire;
-    assign pht_raddr_o = pred_idx;
-    assign pht_we_o    = upd_cond_fire;
+    assign pht_re_o    = pred_fire || upd_cond_fire;
+    assign pht_raddr_o = pred_fire ? pred_idx : idx_q;
+    assign pht_we_o    = (state_q == S_UPD);
     assign pht_waddr_o = idx_q;
 
     bp_sat_ctr #(
         .WIDTH (CTR_BITS),
         .SIGNED(1'b0)
     ) i_sat_ctr (
-        .ctr_i (ctr_q),
-        .inc_i (upd_taken_i),
+        .ctr_i (pht_rdata_i),
+        .inc_i (taken_q),
         .ctr_o (pht_wdata_o)
     );
 
@@ -169,9 +178,10 @@ module bp_gshare_core #(
     always_comb begin
         state_d = state_q;
         case (state_q)
-            S_IDLE:     if (pred_fire)     state_d = S_READ;
-            S_READ:                        state_d = S_WAIT_UPD;
-            S_WAIT_UPD: if (upd_cond_fire) state_d = S_IDLE;
+            S_IDLE:     if (pred_fire)     state_d = S_PRED;
+            S_PRED:                        state_d = S_WAIT_UPD;
+            S_WAIT_UPD: if (upd_cond_fire) state_d = S_UPD;
+            S_UPD:                         state_d = S_IDLE;
             default:                       state_d = S_IDLE;
         endcase
     end
@@ -184,14 +194,14 @@ module bp_gshare_core #(
         end else begin
             state_q <= state_d;
             // shift in the resolved direction; truncation keeps GHR_BITS bits
-            if (upd_cond_fire) ghr_q <= GHR_BITS'({ghr_q, upd_taken_i});
+            if (state_q == S_UPD) ghr_q <= GHR_BITS'({ghr_q, taken_q});
         end
     end
 
     // Datapath registers: no reset (always written before they are used).
     always_ff @(posedge clk_i) begin
-        if (pred_fire)         idx_q <= pred_idx;
-        if (state_q == S_READ) ctr_q <= pht_rdata_i;
+        if (pred_fire)     idx_q   <= pred_idx;
+        if (upd_cond_fire) taken_q <= upd_taken_i;
     end
 
     // -------------------------------------------------------------------------
@@ -211,10 +221,10 @@ module bp_gshare_core #(
             if (upd_is_cond_i && state_q != S_WAIT_UPD)
                 $error("bp_gshare_core: conditional update without a pending prediction");
             if (!upd_is_cond_i && state_q != S_IDLE)
-                $error("bp_gshare_core: unconditional update while a prediction is pending");
+                $error("bp_gshare_core: unconditional update while a branch is in flight");
         end
-        if (rst_ni && pred_req_valid_i && state_q == S_WAIT_UPD)
-            $error("bp_gshare_core: predict request while an update is pending");
+        if (rst_ni && pred_req_valid_i && !pred_req_ready_o)
+            $error("bp_gshare_core: predict request while a branch is in flight");
     end
 `endif
 
