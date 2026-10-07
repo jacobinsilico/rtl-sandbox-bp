@@ -10,3 +10,5 @@ __pycache__
 .envrc
 .obsidian/
 *.lock.hjson
+
+/projects/branch-prediction/stim
