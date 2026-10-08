@@ -4,59 +4,78 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Description:
-#   Full-flow evaluation of one predictor across budgets. For every budget
-#   that has golden dumps under projects/<project>/stim/<predictor>/:
+#   Full-flow evaluation of one predictor across budgets, from its golden
+#   dumps under projects/<project>/stim/<predictor>/<budget>__<config_id>/:
 #
-#     rtl  make sim on every trace's dump (RTL vs CBP5, bit-exact)
+#     rtl  make sim on every trace's dump: RTL vs CBP5, bit-exact. When a
+#          <trace>.state file sits next to the dump (TAGE, hashed perceptron)
+#          it is passed as STATE_FILE and every branch's internal state is
+#          compared too.
 #     syn  make syn of the core (the SRAMs stay outside, in the bench)
 #     sta  make post-syn-sta
-#     gls  make post-syn-sim VCD=1 on one trace (--gls-trace, --gls-lines):
-#          the netlist checked against the dump again, and the activity
-#     dpa  make post-syn-dpa on that activity
+#     gls  make post-syn-sim VCD=1 on every trace (--gls-lines branches):
+#          the netlist checked against the dump again, and its activity
+#     dpa  make post-syn-dpa on each trace's activity (power per trace)
 #
-#   The RTL parameters come from the dump's .json (the CBP5 -D defines), so
-#   every step is built with exactly the config that produced the dumps.
-#   Steps run in this order per budget; a failed step skips the ones that
-#   depend on it. Budgets run one after another (the gate-level flow writes
-#   activity.vcd into a shared run directory, so runs must not overlap).
+#   The PILOT budget (--pilot, default the smallest) runs first, all steps on
+#   all traces. If any of its steps fails the script stops, so a broken
+#   config is found before hours are spent on the other budgets. Then every
+#   other budget runs. Budgets run one after another (the gate-level flow
+#   writes activity.vcd into a shared run directory, so runs must not
+#   overlap).
 #
 #   Resumable: each finished step leaves eval/<predictor>/<budget>/<step>.json
 #   (status, metrics, the exact command key). A step whose json is ok and
-#   whose key is unchanged is skipped; --rerun forces everything.
+#   whose key is unchanged is skipped; --rerun forces everything. The CSV is
+#   rebuilt from these records on every run.
+#
+#   RTL parameters come from the dump's metadata, so every step is built with
+#   exactly the config that produced the dumps:
+#     gshare, g_perceptron  the .json (-D defines)
+#     hashed_perceptron     the .log (PREDICTOR_CONFIG, PREDICTOR_HIST_LENS)
+#     tage_cb               the .log (PREDICTOR_CONFIG, PREDICTOR_KNOBS,
+#                           PREDICTOR_HIST_LENS); 2-way configs are skipped
+#                           until the 2-way RTL exists
 #
 # Output:
 #   projects/<project>/eval/<predictor>/<budget>/<step>.{log,json}
-#   projects/<project>/eval/<predictor>_results.csv     one row per budget
+#   projects/<project>/eval/<predictor>_results.csv   one row per budget x trace
 #   a summary table on stdout
+#   Plots: plot_eval.py reads the CSVs.
 #
-#   Energy per conditional branch (logic only, SRAM excluded):
-#     E = P_total * TB_CYCLES * T_clk / TB_COND_BR   (from the gate-level run)
+#   Energy per conditional branch (logic only, SRAM excluded), per trace:
+#     E = P_total * TB_CYCLES * T_clk / TB_COND_BR   (gate-level run)
 #   SRAM traffic per conditional branch: TB_SRAM_READS / TB_COND_BR, ...
 #   The SRAM structures (PREDICTOR_STRUCT lines of the CBP5 log) are copied
 #   into the CSV for the CACTI step.
 #
 # Usage (after `source sourceme.sh`):
-#   python3 projects/branch-prediction/scripts/evaluate.py PREDICTOR [options]
-#     PREDICTOR          gshare | g_perceptron
+#   /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py PREDICTOR [options]
+#     PREDICTOR          gshare | g_perceptron | hashed_perceptron | tage_cb
 #     --budgets 1KB 4KB  subset of budgets (default: all with dumps)
+#     --pilot 4KB        budget run first; stop if it fails (default: smallest)
 #     --steps rtl syn    subset of steps (default: rtl syn sta gls dpa)
 #     --rtl-lines N      branch lines per RTL check (default 0 = whole trace)
-#     --gls-trace PAT    trace for the gate-level run (default 'fdd*')
-#     --gls-lines N      branch lines for the gate-level run (default 50000)
+#     --gls-lines N      branch lines per gate-level run (default 50000)
 #     --clk NS           clock period (default 1.0)
 #     --extra K=V ...    extra RTL parameters, e.g. --extra Y_REG=1
 #     --hier             also synthesize with KEEP_HIERARCHY=1 (area per module)
+#     --print-params     print each budget's top and PARAMS, then exit
 #     --rerun            ignore finished steps
 #     --dry-run          print the make commands only
 #
-#   Adding a predictor: one entry in PREDICTORS below.
+#   Examples:
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --print-params
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --steps rtl --rtl-lines 10000
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py hashed_perceptron
+#
+#   Adding a predictor: a params function and one entry in PREDICTORS.
 #   Report parsing is tolerant: a value that cannot be found is left empty
 #   and a WARNING names the report file.
 # -----------------------------------------------------------------------------
 
 import argparse
 import csv
-import fnmatch
 import glob
 import json
 import math
@@ -70,45 +89,139 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJ_DIR = os.path.dirname(SCRIPT_DIR)
 PROJECT = os.path.basename(PROJ_DIR)
 REPO = os.environ.get("REPO_HOME") or os.path.dirname(os.path.dirname(PROJ_DIR))
+EVAL_DIR = os.path.join(PROJ_DIR, "eval")
 
 STEPS = ["rtl", "syn", "sta", "gls", "dpa"]
-NEEDS = {"rtl": [], "syn": [], "sta": ["syn"], "gls": ["syn"], "dpa": ["gls"]}
 
 
 # =============================================================================
-# Predictors: CBP5 defines -> RTL top and parameters
+# Dump metadata (<stem> = dump path without .golden.txt)
 # =============================================================================
 
-def _need(d, key, default=None):
+def read(path):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def json_defines(stem):
+    """-D defines of the CBP5 build, from the dump's .json."""
+    return dict(re.findall(r"-D(\w+)=(\S+)", json.load(open(stem + ".json"))["defines"]))
+
+
+def log_pairs(stem, tag, name=None):
+    """KEY VALUE pairs of a '<tag> [name] K V K V ...' line of the dump's .log."""
+    pat = rf"^{tag} {re.escape(name)} (.*)$" if name else rf"^{tag} (.*)$"
+    m = re.search(pat, read(stem + ".log"), re.M)
+    if not m:
+        return None
+    tok = m.group(1).split()
+    return dict(zip(tok[0::2], tok[1::2]))
+
+
+def hist_lens(stem):
+    m = re.search(r"^PREDICTOR_HIST_LENS((?: \d+)+)\s*$", read(stem + ".log"), re.M)
+    if not m:
+        raise ValueError(f"no PREDICTOR_HIST_LENS line in {stem}.log")
+    return [int(x) for x in m.group(1).split()]
+
+
+def need(d, key, default=None):
     if key in d:
         return int(d[key])
     if default is not None:
         return default
-    raise ValueError(f"-D{key} missing")
+    raise ValueError(f"{key} missing")
 
 
-def map_gshare(d):
-    ghr, idx, ent = _need(d, "GHR_BITS"), _need(d, "PHT_INDEX_BITS"), _need(d, "PHT_ENTRIES")
+# =============================================================================
+# Predictors: dump metadata -> RTL parameters of the core
+# =============================================================================
+
+def params_gshare(stem):
+    d = json_defines(stem)
+    ghr, idx, ent = need(d, "GHR_BITS"), need(d, "PHT_INDEX_BITS"), need(d, "PHT_ENTRIES")
     if ent != 1 << idx:
         raise ValueError(f"PHT_ENTRIES {ent} != 2^PHT_INDEX_BITS")
-    return {"GHR_BITS": ghr, "INDEX_BITS": idx, "PC_SHIFT": _need(d, "PC_SHIFT", 0)}
+    return {"GHR_BITS": ghr, "INDEX_BITS": idx, "PC_SHIFT": need(d, "PC_SHIFT", 0)}
 
 
-def map_g_perceptron(d):
-    h, n = _need(d, "GHR_LEN"), _need(d, "NUM_PERCEPTRONS")
+def params_g_perceptron(stem):
+    d = json_defines(stem)
+    h, n = need(d, "GHR_LEN"), need(d, "NUM_PERCEPTRONS")
     if not 1 <= h <= 64:
         raise ValueError(f"GHR_LEN {h} outside the RTL range 1..64")
     if n < 2:
         raise ValueError(f"NUM_PERCEPTRONS {n} not supported by the RTL")
-    return {"GHR_LEN": h, "NUM_PERCEPTRONS": n, "WEIGHT_BITS": _need(d, "WEIGHT_BITS"),
-            "THETA_ALPHA_PCT": _need(d, "THETA_ALPHA_PCT", 100),
-            "PC_SHIFT": _need(d, "PC_SHIFT", 0)}
+    return {"GHR_LEN": h, "NUM_PERCEPTRONS": n, "WEIGHT_BITS": need(d, "WEIGHT_BITS"),
+            "THETA_ALPHA_PCT": need(d, "THETA_ALPHA_PCT", 100),
+            "PC_SHIFT": need(d, "PC_SHIFT", 0)}
 
 
-# stim directory name -> (RTL core = synthesis top = bench DUT, mapping)
+def params_hashed_perceptron(stem):
+    kv = log_pairs(stem, "PREDICTOR_CONFIG", "hashed_perceptron")
+    if kv is None:
+        raise ValueError(f"no 'PREDICTOR_CONFIG hashed_perceptron' line in {stem}.log")
+    if kv.get("VARIANT") != "HP" or kv.get("HP_HASH") != "1" or "TABLE_LOGS" not in kv:
+        raise ValueError("RTL supports plain HP with HP_HASH=1 and TABLE_LOGS/TABLE_WBITS only "
+                         f"(VARIANT {kv.get('VARIANT')}, HP_HASH {kv.get('HP_HASH')})")
+    n = need(kv, "NUM_TABLES")
+    logs = [int(x) for x in kv["TABLE_LOGS"].strip("{}").split(",")]
+    wbits = [int(x) for x in kv["TABLE_WBITS"].strip("{}").split(",")]
+    hist = hist_lens(stem)
+    if n > 8 or not (len(logs) == len(wbits) == len(hist) == n):
+        raise ValueError(f"need NUM_TABLES <= 8 and one LOG/WBITS/HIST per table (NUM_TABLES {n})")
+    p = {"NUM_TABLES": n}
+    p.update({f"T{t}_LOG": logs[t] if t < n else 0 for t in range(8)})
+    p.update({f"T{t}_WBITS": wbits[t] if t < n else 0 for t in range(8)})
+    p.update({f"T{t}_HIST": hist[t] if t < n else 0 for t in range(8)})
+    for rtl_key, log_key in (("BIAS_ENTRIES", "BIAS_ENTRIES"), ("BIAS_WEIGHT_BITS", "BIAS_WEIGHT_BITS"),
+                             ("THETA_BITS", "THETA_BITS"), ("TC_BITS", "TC_BITS"),
+                             ("HP_FOLDS", "HP_FOLDS"), ("HP_PATH_BITS", "PATH_BITS"),
+                             ("HP_PCMIX", "HP_PCMIX"), ("HP_PC_SHIFT", "HP_PC_SHIFT")):
+        p[rtl_key] = need(kv, log_key)
+    return p
+
+
+# tage_cb.h knobs the RTL hard-codes (checked when PREDICTOR_KNOBS is logged)
+TAGE_FIXED = {"CWIDTH": 3, "UWIDTH": 2, "BIMWIDTH": 3, "HYSTSHIFT": 1, "MAXBR": 4,
+              "NBREADPERTABLE": 4, "CB_ADJACENT": 1, "CB_SHARED": 1, "CB_FILTERALLOC": 1,
+              "CB_FORCEU": 1, "CB_PROTECTU": 1, "CB_UPDATEALT": 1, "CB_RANDINIT": 0}
+
+
+def params_tage_cb(stem):
+    kv = log_pairs(stem, "PREDICTOR_CONFIG", "tage_cb")
+    if kv is None:
+        raise ValueError(f"no 'PREDICTOR_CONFIG tage_cb' line in {stem}.log (CB_SC must be 0)")
+    for key, want in (("CB_SC", 0), ("AHEAD", 0), ("CB_OPTTAGE", 1)):
+        if need(kv, key) != want:
+            raise ValueError(f"RTL needs {key}={want}, the dump has {kv[key]}")
+    if need(kv, "LOGASSOC") != 0:
+        raise ValueError("LOGASSOC=1 (2-way PSK/REPSK) is not in the RTL yet")
+    knobs = log_pairs(stem, "PREDICTOR_KNOBS") or {}
+    bad = [f"{k}={knobs[k]}" for k, v in TAGE_FIXED.items() if k in knobs and int(knobs[k]) != v]
+    if bad:
+        raise ValueError(f"RTL hard-codes {TAGE_FIXED}; the dump has {' '.join(bad)}")
+    n = need(kv, "NHIST")
+    hist = hist_lens(stem)
+    if len(hist) != n or n > 14:
+        raise ValueError(f"need NHIST <= 14 and one history length per table (NHIST {n})")
+    p = {"NHIST": n, "LOGT": need(kv, "LOGT"), "LOGASSOC": 0, "LOGB": need(kv, "LOGB"),
+         "TBITS": need(kv, "TBITS"), "CB_LMP": need(kv, "CB_LMP"),
+         "ILEN_CAP": need(kv, "CB_ILEN_CAP")}
+    p.update({f"T{t}_HIST": hist[t - 1] if t <= n else 0 for t in range(1, 15)})
+    return p
+
+
+# stim directory name -> RTL core (= synthesis top = bench DUT), parameters,
+# and whether its bench takes a STATE_FILE
 PREDICTORS = {
-    "gshare":       ("bp_gshare_core", map_gshare),
-    "g_perceptron": ("bp_gp_core",     map_g_perceptron),
+    "gshare":            {"top": "bp_gshare_core", "params": params_gshare,            "state": False},
+    "g_perceptron":      {"top": "bp_gp_core",     "params": params_g_perceptron,      "state": False},
+    "hashed_perceptron": {"top": "bp_hp_core",     "params": params_hashed_perceptron, "state": True},
+    "tage_cb":           {"top": "bp_tage_core",   "params": params_tage_cb,           "state": True},
 }
 
 
@@ -124,17 +237,14 @@ def params_str(p):
     return " ".join(f"{k}={v}" for k, v in p.items())
 
 
+def budget_kb(label):
+    m = re.match(r"(\d+)KB$", label)
+    return int(m.group(1)) if m else None
+
+
 def budget_key(label):
-    m = re.match(r"(\d+)KB", label)
-    return (int(m.group(1)) if m else 1 << 30, label)
-
-
-def read(path):
-    try:
-        with open(path, errors="replace") as f:
-            return f.read()
-    except OSError:
-        return ""
+    kb = budget_kb(label)
+    return (kb if kb is not None else 1 << 30, label)
 
 
 def first(patterns, text, cast=float):
@@ -158,7 +268,7 @@ def report_text(out_dir, prefer=None):
 
 def tb_metrics(text):
     keys = ["TB_LINES", "TB_COND_BR", "TB_UNCOND_BR", "TB_RTL_MISPRED", "TB_REF_MISPRED",
-            "TB_CYCLES", "TB_SRAM_READS", "TB_SRAM_WRITES"]
+            "TB_CYCLES", "TB_SRAM_READS", "TB_SRAM_WRITES", "TB_STATE_LINES", "TB_STATE_CKSUMS"]
     m = {k.lower()[3:]: first([rf"^{k}\s*:\s*(\d+)"], text, int) for k in keys}
     m["passed"] = "PASSED" in text
     return m
@@ -239,7 +349,7 @@ def parse_power(out_dir):
 
 
 # =============================================================================
-# Steps
+# One budget: its dumps, its steps and their records
 # =============================================================================
 
 def make(args, target, variables, logfile):
@@ -252,193 +362,191 @@ def make(args, target, variables, logfile):
     return rc, read(logfile)
 
 
-def stim_param(path):
-    return f'STIM_FILE="{path}"'          # Verilator wants the quotes (no spaces in paths)
+def quoted(name, path):
+    return f'{name}="{path}"'           # Verilator wants the quotes (no spaces in paths)
 
 
 class Budget:
-    def __init__(self, args, top, mapping, label, dump_dir):
-        self.args, self.top, self.label, self.dir = args, top, label, dump_dir
+    def __init__(self, args, spec, label, dump_dir):
+        self.args, self.spec, self.top, self.label = args, spec, spec["top"], label
+        self.kb = budget_kb(label)
         self.cid = os.path.basename(dump_dir).split("__", 1)[1]
-        self.dumps = sorted(glob.glob(os.path.join(dump_dir, "*.golden.txt")))
-        jsons = [d[:-len(".golden.txt")] + ".json" for d in self.dumps]
-        meta = json.load(open(jsons[0]))
-        self.defines = meta["defines"]
-        self.core = mapping(dict(re.findall(r"-D(\w+)=(\S+)", self.defines)))
+        dumps = sorted(glob.glob(os.path.join(dump_dir, "*.golden.txt")))
+        # trace short name (fdd_su_v1_0) -> dump stem (path without .golden.txt)
+        self.traces = {os.path.basename(d).split(".")[0]: d[:-len(".golden.txt")] for d in dumps}
+        stem0 = next(iter(self.traces.values()))
+        self.core = spec["params"](stem0)
         for kv in args.extra:
             k, _, v = kv.partition("=")
             self.core[k] = v
-        cbp_log = read(self.dumps[0][:-len(".golden.txt")] + ".log")
+        cbp_log = read(stem0 + ".log")
         self.size_bits = first([r"PREDICTOR_CONFIG.*\bSIZE_BITS (\d+)"], cbp_log, int)
         self.structs = ";".join(f"{n}:{e}x{w}" for n, e, w in re.findall(
             r"^PREDICTOR_STRUCT (\S+) ENTRIES (\d+) WIDTH (\d+)", cbp_log, re.MULTILINE))
-        self.edir = os.path.join(PROJ_DIR, "eval", args.predictor, label)
-        os.makedirs(self.edir, exist_ok=True)
-        tag = f"{args.predictor}_{label}"
-        self.out = {s: f"{s}_{tag}" for s in ("syn", "sta", "gls", "dpa")}
-        self.out["syn_hier"] = f"syn_{tag}_hier"
+        self.edir = os.path.join(EVAL_DIR, args.predictor, label)
+        self.tag = f"{args.predictor}_{label}"
 
     # ---- bookkeeping ----
-    def rec_path(self, step):
-        return os.path.join(self.edir, f"{step}.json")
-
     def load(self, step):
         try:
-            return json.load(open(self.rec_path(step)))
+            return json.load(open(os.path.join(self.edir, f"{step}.json")))
         except (OSError, ValueError):
             return None
+
+    def ok(self, step):
+        return (self.load(step) or {}).get("status") == "ok"
 
     def done(self, step, key):
         rec = self.load(step)
         return rec is not None and rec.get("status") == "ok" and rec.get("key") == key \
             and not self.args.rerun
 
-    def save(self, step, key, status, metrics, t0):
-        rec = {"step": step, "key": key, "status": status, "metrics": metrics,
-               "time_s": round(time.time() - t0, 1)}
+    def save(self, step, key, ok, metrics, t0):
         if not self.args.dry_run:
-            with open(self.rec_path(step), "w") as f:
-                json.dump(rec, f, indent=1)
-        return rec
+            os.makedirs(self.edir, exist_ok=True)
+            with open(os.path.join(self.edir, f"{step}.json"), "w") as f:
+                json.dump({"step": step, "key": key, "status": "ok" if ok else "failed",
+                           "metrics": metrics, "time_s": round(time.time() - t0, 1)}, f, indent=1)
 
-    # ---- steps ----
-    def run_rtl(self):
-        key = f"{self.top}|{params_str(self.core)}|{self.args.rtl_lines}|{self.args.clk}"
-        if self.done("rtl", key):
-            return "ok (kept)"
-        t0, per_trace, ok = time.time(), {}, True
-        for dump in self.dumps:
-            trace = os.path.basename(dump)[:-len(".golden.txt")]
-            short = trace.split(".")[0]
-            logf = os.path.join(self.edir, f"rtl_{short}.log")
-            rc, text = make(self.args, "sim", [
-                ("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", self.args.clk),
-                ("OUT_DIR", f"sim_{self.args.predictor}_{self.label}_{short}"),
-                ("PARAMS", f"{params_str(self.core)} MAX_LINES={self.args.rtl_lines} {stim_param(dump)}")],
-                logf)
-            if self.args.dry_run:
-                continue
-            m = tb_metrics(text)
-            m["ok"] = rc == 0 and m["passed"]
-            per_trace[trace] = m
-            ok &= m["ok"]
-            log(f"    rtl {short:12s} {'PASS' if m['ok'] else 'FAIL'}  cond={m['cond_br']} "
-                f"mispred={m['rtl_mispred']}" + ("" if m["ok"] else f"  (see {logf})"))
-        if self.args.dry_run:
-            return "dry"
-        self.save("rtl", key, "ok" if ok else "failed", {"traces": per_trace}, t0)
-        return "ok" if ok else "FAILED"
+    def key(self, step):
+        """Command key of a step: a step reruns when this changes."""
+        a, p = self.args, params_str(self.core)
+        if step.startswith("rtl_"):
+            stem = self.traces[step[4:]]
+            state = stem + ".state" if self.spec["state"] and os.path.exists(stem + ".state") else ""
+            return f"{self.top}|{p}|{a.rtl_lines}|{a.clk}|{state}"
+        if step in ("syn", "syn_hier"):
+            return f"{self.top}|{p}|{a.clk}|{step == 'syn_hier'}"
+        syn_key = (self.load("syn") or {}).get("key")
+        if step == "sta":
+            return f"{syn_key}|{a.clk}"
+        if step.startswith("gls_"):
+            return f"{syn_key}|{self.traces[step[4:]]}|{a.gls_lines}"
+        if step.startswith("dpa_"):
+            return f"{(self.load('gls_' + step[4:]) or {}).get('key')}"
+        raise KeyError(step)
 
-    def run_syn(self, hier=False):
-        step = "syn_hier" if hier else "syn"
-        key = f"{self.top}|{params_str(self.core)}|{self.args.clk}|{hier}"
+    def run_step(self, step):
+        """Runs one step unless finished; returns a status string."""
+        key = self.key(step)
         if self.done(step, key):
             return "ok (kept)"
-        t0 = time.time()
-        variables = [("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", self.args.clk),
-                     ("OUT_DIR", self.out[step]), ("PARAMS", params_str(self.core))]
-        if hier:
-            variables.append(("KEEP_HIERARCHY", 1))
-        rc, _ = make(self.args, "syn", variables, os.path.join(self.edir, f"{step}.log"))
-        if self.args.dry_run:
+        t0, a, kind = time.time(), self.args, step.split("_")[0]
+        trace = step.split("_", 1)[1] if step.startswith(("rtl_", "gls_", "dpa_")) else None
+        logf = os.path.join(self.edir, f"{step}.log")
+        if not a.dry_run:
+            os.makedirs(self.edir, exist_ok=True)
+        base = [("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", a.clk)]
+        p = params_str(self.core)
+
+        if kind == "rtl":
+            stem = self.traces[trace]
+            par = f"{p} MAX_LINES={a.rtl_lines} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            if self.spec["state"] and os.path.exists(stem + ".state"):
+                par += " " + quoted("STATE_FILE", stem + ".state")
+            rc, text = make(a, "sim", base + [("OUT_DIR", f"sim_{self.tag}_{trace}"),
+                                              ("PARAMS", par)], logf)
+            m = tb_metrics(text)
+            ok = rc == 0 and m["passed"]
+        elif kind == "syn":
+            var = base + [("OUT_DIR", f"{kind}_{self.tag}" + ("_hier" if step == "syn_hier" else "")),
+                          ("PARAMS", p)]
+            if step == "syn_hier":
+                var.append(("KEEP_HIERARCHY", 1))
+            rc, _ = make(a, "syn", var, logf)
+            ok = rc == 0
+            m = ((parse_area_hier if step == "syn_hier" else parse_area)(var[2][1])
+                 if ok and not a.dry_run else {})
+        elif kind == "sta":
+            rc, _ = make(a, "post-syn-sta", base + [("OUT_DIR", f"sta_{self.tag}"),
+                                                    ("NETLIST_DIR", f"syn_{self.tag}")], logf)
+            ok = rc == 0
+            m = parse_sta(f"sta_{self.tag}") if ok and not a.dry_run else {}
+        elif kind == "gls":
+            stem = self.traces[trace]
+            par = f"{p} MAX_LINES={a.gls_lines} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            rc, text = make(a, "post-syn-sim", base + [
+                ("OUT_DIR", f"gls_{self.tag}_{trace}"), ("NETLIST_DIR", f"syn_{self.tag}"),
+                ("VCD", 1), ("PARAMS", par)], logf)
+            m = tb_metrics(text)
+            ok = rc == 0 and m["passed"]
+        else:  # dpa
+            rc, _ = make(a, "post-syn-dpa", base + [
+                ("OUT_DIR", f"dpa_{self.tag}_{trace}"), ("NETLIST_DIR", f"syn_{self.tag}"),
+                ("VCD_DIR", f"gls_{self.tag}_{trace}")], logf)
+            ok = rc == 0
+            m = parse_power(f"dpa_{self.tag}_{trace}") if ok and not a.dry_run else {}
+
+        if a.dry_run:
             return "dry"
-        metrics = (parse_area_hier if hier else parse_area)(self.out[step]) if rc == 0 else {}
-        self.save(step, key, "ok" if rc == 0 else "failed", metrics, t0)
-        return "ok" if rc == 0 else f"FAILED (exit {rc})"
+        self.save(step, key, ok, m, t0)
+        if kind in ("rtl", "gls"):
+            extra = f"  state lines={m.get('state_lines')}" if m.get("state_lines") else ""
+            return (f"{'ok' if ok else 'FAILED'}  cond={m.get('cond_br')} mispred={m.get('rtl_mispred')}"
+                    f"{extra}" + ("" if ok else f"  (see {logf})"))
+        return "ok" if ok else f"FAILED (exit {rc}, see {logf})"
 
-    def run_sta(self):
-        key = f"{self.load('syn') and self.load('syn').get('key')}|{self.args.clk}"
-        if self.done("sta", key):
-            return "ok (kept)"
-        t0 = time.time()
-        rc, _ = make(self.args, "post-syn-sta", [
-            ("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", self.args.clk),
-            ("OUT_DIR", self.out["sta"]), ("NETLIST_DIR", self.out["syn"])],
-            os.path.join(self.edir, "sta.log"))
-        if self.args.dry_run:
-            return "dry"
-        metrics = parse_sta(self.out["sta"]) if rc == 0 else {}
-        self.save("sta", key, "ok" if rc == 0 else "failed", metrics, t0)
-        return "ok" if rc == 0 else f"FAILED (exit {rc})"
+    def run(self):
+        """All requested steps of this budget; True if all of them are ok."""
+        a, all_ok = self.args, True
+        order = []
+        if "rtl" in a.steps:
+            order += [f"rtl_{t}" for t in self.traces]
+        if "syn" in a.steps:
+            order += ["syn"] + (["syn_hier"] if a.hier else [])
+        if "sta" in a.steps:
+            order += ["sta"]
+        for t in self.traces:
+            order += [f"gls_{t}"] if "gls" in a.steps else []
+            order += [f"dpa_{t}"] if "dpa" in a.steps else []
+        for step in order:
+            dep = {"sta": "syn", "gls": "syn", "dpa": "gls_" + step[4:]}.get(step.split("_")[0])
+            if dep and not a.dry_run and not self.ok(dep):
+                status = f"FAILED (needs {dep})"
+            else:
+                status = self.run_step(step)
+            log(f"    {step:24s} {status}")
+            all_ok &= status.startswith(("ok", "dry"))
+        return all_ok
 
-    def gls_dump(self):
-        for d in self.dumps:
-            if fnmatch.fnmatch(os.path.basename(d), self.args.gls_trace + ".golden.txt") or \
-               fnmatch.fnmatch(os.path.basename(d), self.args.gls_trace):
-                return d
-        return self.dumps[0]
-
-    def run_gls(self):
-        dump = self.gls_dump()
-        key = f"{self.load('syn') and self.load('syn').get('key')}|{dump}|{self.args.gls_lines}"
-        if self.done("gls", key):
-            return "ok (kept)"
-        t0 = time.time()
-        logf = os.path.join(self.edir, "gls.log")
-        rc, text = make(self.args, "post-syn-sim", [
-            ("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", self.args.clk),
-            ("OUT_DIR", self.out["gls"]), ("NETLIST_DIR", self.out["syn"]), ("VCD", 1),
-            ("PARAMS", f"{params_str(self.core)} MAX_LINES={self.args.gls_lines} {stim_param(dump)}")],
-            logf)
-        if self.args.dry_run:
-            return "dry"
-        m = tb_metrics(text)
-        m["trace"] = os.path.basename(dump)[:-len(".golden.txt")]
-        ok = rc == 0 and m["passed"]
-        self.save("gls", key, "ok" if ok else "failed", m, t0)
-        return "ok" if ok else f"FAILED (see {logf})"
-
-    def run_dpa(self):
-        key = f"{self.load('gls') and self.load('gls').get('key')}"
-        if self.done("dpa", key):
-            return "ok (kept)"
-        t0 = time.time()
-        rc, _ = make(self.args, "post-syn-dpa", [
-            ("TOP_LEVEL", self.top), ("CLK_PERIOD_NS", self.args.clk),
-            ("OUT_DIR", self.out["dpa"]), ("NETLIST_DIR", self.out["syn"]),
-            ("VCD_DIR", self.out["gls"])], os.path.join(self.edir, "dpa.log"))
-        if self.args.dry_run:
-            return "dry"
-        metrics = parse_power(self.out["dpa"]) if rc == 0 else {}
-        self.save("dpa", key, "ok" if rc == 0 else "failed", metrics, t0)
-        return "ok" if rc == 0 else f"FAILED (exit {rc})"
-
-    # ---- result row ----
-    def row(self):
+    # ---- CSV rows: one per trace ----
+    def rows(self):
         def met(step):
-            rec = self.load(step)
-            return (rec or {}).get("metrics", {}) if (rec or {}).get("status") == "ok" else {}
-        rtl, syn, sta, gls, dpa = (met(s) for s in STEPS)
-        r = {"predictor": self.args.predictor, "budget": self.label, "config_id": self.cid,
-             "rtl_params": params_str(self.core), "size_bits": self.size_bits,
-             "sram_structs": self.structs, "clk_ns": self.args.clk}
-        traces = (rtl or {}).get("traces", {})
-        r["rtl_pass"] = f"{sum(t['ok'] for t in traces.values())}/{len(self.dumps)}" if traces else ""
-        mpk = [1000.0 * t["rtl_mispred"] / t["cond_br"] for t in traces.values()
-               if t.get("ok") and t.get("cond_br")]
-        r["mpkbr_geomean"] = round(math.exp(sum(map(math.log, mpk)) / len(mpk)), 4) \
-            if mpk and all(v > 0 for v in mpk) else ""
-        for k in ("area_um2", "cells", "flops"):
-            r[k] = syn.get(k, "")
-        for k in ("wns", "tns", "crit_start", "crit_end"):
-            r[k] = sta.get(k, "")
-        r["gls_pass"] = gls.get("passed", "")
-        for k in ("cond_br", "cycles", "sram_reads", "sram_writes"):
-            r[f"gls_{k}"] = gls.get(k, "")
-        for k in ("p_total_w", "p_sequential_w", "p_combinational_w", "p_clock_w",
-                  "p_internal_w", "p_switching_w", "p_leakage_w", "vcd_annotated", "vcd_unannotated"):
-            r[k] = dpa.get(k, "")
-        cond, cyc = gls.get("cond_br"), gls.get("cycles")
-        if cond and cyc:
-            r["cycles_per_cond"] = round(cyc / cond, 4)
-            r["sram_rd_per_cond"] = round(gls["sram_reads"] / cond, 4)
-            r["sram_wr_per_cond"] = round(gls["sram_writes"] / cond, 4)
-            if dpa.get("p_total_w") is not None:
-                r["e_logic_pj_per_cond"] = round(
-                    dpa["p_total_w"] * cyc * float(self.args.clk) * 1e-9 / cond * 1e12, 4)
-        hier = met("syn_hier")
-        r["area_by_module"] = ";".join(f"{k}:{v}" for k, v in hier.items()) if hier else ""
-        return r
+            rec = self.load(step) or {}
+            return rec.get("metrics", {}) if rec.get("status") == "ok" else {}
+        syn, sta, hier = met("syn"), met("sta"), met("syn_hier")
+        out = []
+        for trace in self.traces:
+            rtl, gls, dpa = met(f"rtl_{trace}"), met(f"gls_{trace}"), met(f"dpa_{trace}")
+            r = {"predictor": self.args.predictor, "budget": self.label, "budget_kb": self.kb,
+                 "trace": trace, "config_id": self.cid, "rtl_params": params_str(self.core),
+                 "size_bits": self.size_bits, "sram_structs": self.structs, "clk_ns": self.args.clk,
+                 "rtl_pass": rtl.get("passed", ""), "rtl_lines": self.args.rtl_lines,
+                 "rtl_state_lines": rtl.get("state_lines", "")}
+            cond = rtl.get("cond_br")
+            r["mpkbr"] = round(1000.0 * rtl["rtl_mispred"] / cond, 4) if cond else ""
+            for k in ("area_um2", "cells", "flops"):
+                r[k] = syn.get(k, "")
+            for k in ("wns", "tns", "crit_start", "crit_end"):
+                r[k] = sta.get(k, "")
+            r["gls_pass"] = gls.get("passed", "")
+            for k in ("cond_br", "cycles", "sram_reads", "sram_writes"):
+                r[f"gls_{k}"] = gls.get(k, "")
+            for k in ("p_total_w", "p_sequential_w", "p_combinational_w", "p_clock_w",
+                      "p_internal_w", "p_switching_w", "p_leakage_w",
+                      "vcd_annotated", "vcd_unannotated"):
+                r[k] = dpa.get(k, "")
+            gc, cyc = gls.get("cond_br"), gls.get("cycles")
+            if gc and cyc:
+                r["cycles_per_cond"] = round(cyc / gc, 4)
+                r["sram_rd_per_cond"] = round(gls["sram_reads"] / gc, 4)
+                r["sram_wr_per_cond"] = round(gls["sram_writes"] / gc, 4)
+                if dpa.get("p_total_w") is not None:
+                    r["e_logic_pj_per_cond"] = round(
+                        dpa["p_total_w"] * cyc * float(self.args.clk) * 1e-9 / gc * 1e12, 4)
+            r["area_by_module"] = ";".join(f"{k}:{v}" for k, v in hier.items())
+            out.append(r)
+        return out
 
 
 # =============================================================================
@@ -446,17 +554,17 @@ class Budget:
 # =============================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__ if __doc__ else "",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description="Full-flow evaluation of one predictor (see the header).")
     ap.add_argument("predictor", choices=sorted(PREDICTORS))
     ap.add_argument("--budgets", nargs="+", default=None)
+    ap.add_argument("--pilot", default=None)
     ap.add_argument("--steps", nargs="+", default=STEPS, choices=STEPS)
     ap.add_argument("--rtl-lines", type=int, default=0)
-    ap.add_argument("--gls-trace", default="fdd*")
     ap.add_argument("--gls-lines", type=int, default=50000)
     ap.add_argument("--clk", default="1.0")
     ap.add_argument("--extra", nargs="+", default=[], metavar="K=V")
     ap.add_argument("--hier", action="store_true")
+    ap.add_argument("--print-params", action="store_true")
     ap.add_argument("--rerun", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -465,78 +573,79 @@ def main():
     except ValueError:
         ap.error(f"--clk must be a number of nanoseconds, got '{args.clk}'")
 
-    top, mapping = PREDICTORS[args.predictor]
+    spec = PREDICTORS[args.predictor]
     stim = os.path.join(PROJ_DIR, "stim", args.predictor)
-    dirs = sorted(glob.glob(os.path.join(stim, "*__*")), key=lambda d: budget_key(os.path.basename(d)))
+    dirs = sorted(glob.glob(os.path.join(stim, "*__*")),
+                  key=lambda d: budget_key(os.path.basename(d).split("__", 1)[0]))
     budgets = []
     for d in dirs:
         label = os.path.basename(d).split("__", 1)[0]
-        if args.budgets and label not in args.budgets:
-            continue
         if not glob.glob(os.path.join(d, "*.golden.txt")):
             continue
         try:
-            budgets.append(Budget(args, top, mapping, label, d))
+            budgets.append(Budget(args, spec, label, d))
         except (ValueError, KeyError, OSError) as exc:
             log(f"SKIP {label}: {exc}")
     if not budgets:
         sys.exit(f"No usable dumps for '{args.predictor}' in {stim}")
 
-    log(f"project {PROJECT}, predictor {args.predictor} ({top}), clk {args.clk} ns, "
-        f"steps {' '.join(args.steps)}{' + syn_hier' if args.hier else ''}")
-    for b in budgets:
-        log(f"\n=== {b.label}  {b.cid}\n    params {params_str(b.core)}")
-        status = {}
-        for step in STEPS:
-            if step not in args.steps:
-                continue
-            blocked = [n for n in NEEDS[step]
-                       if (status.get(n) or "").startswith("FAILED")
-                       or (n not in args.steps and not args.dry_run
-                           and (b.load(n) or {}).get("status") != "ok")]
-            if blocked:
-                status[step] = f"FAILED (needs {', '.join(blocked)})"
-            else:
-                status[step] = getattr(b, f"run_{step}")()
-            log(f"    {step:4s} {status[step]}")
-            if step == "syn" and args.hier and not status[step].startswith("FAILED"):
-                log(f"    hier {b.run_syn(hier=True)}")
+    if args.print_params:
+        for b in budgets:
+            log(f"{b.label:>5s} {b.top} traces={','.join(b.traces)}\n      {params_str(b.core)}")
+        return
+
+    todo = [b for b in budgets if not args.budgets or b.label in args.budgets]
+    if not todo:
+        sys.exit(f"none of --budgets {args.budgets} has usable dumps "
+                 f"(have: {' '.join(b.label for b in budgets)})")
+    pilot = args.pilot or todo[0].label
+    if pilot not in [b.label for b in todo]:
+        sys.exit(f"--pilot {pilot} is not among the budgets to run")
+    todo.sort(key=lambda b: (b.label != pilot, budget_key(b.label)))
+
+    log(f"project {PROJECT}, predictor {args.predictor} ({spec['top']}), clk {args.clk} ns, "
+        f"steps {' '.join(args.steps)}{' + syn_hier' if args.hier else ''}, pilot {pilot}")
+    for b in todo:
+        log(f"\n=== {b.label}{' (pilot)' if b.label == pilot else ''}  {b.cid}\n"
+            f"    params {params_str(b.core)}")
+        ok = b.run()
+        if b.label == pilot and not ok and not args.dry_run:
+            log(f"\nPILOT {pilot} FAILED: fix it before running the other budgets "
+                f"(rerunning resumes where it stopped).")
+            break
 
     if args.dry_run:
         return
 
-    rows = [b.row() for b in budgets]
-    out_csv = os.path.join(PROJ_DIR, "eval", f"{args.predictor}_results.csv")
-    old = []
-    if os.path.exists(out_csv):                    # keep budgets not run this time
-        with open(out_csv, newline="") as f:
-            old = [r for r in csv.DictReader(f) if r.get("budget") not in {x["budget"] for x in rows}]
-    allrows = sorted(old + rows, key=lambda r: budget_key(r["budget"]))
-    fields = list(dict.fromkeys(k for r in allrows for k in r))
+    # The CSV is rebuilt from the records of every budget, run now or before.
+    rows = [r for b in budgets for r in b.rows()
+            if any(r.get(k) not in ("", None) for k in ("rtl_pass", "area_um2", "p_total_w"))]
+    out_csv = os.path.join(EVAL_DIR, f"{args.predictor}_results.csv")
+    os.makedirs(EVAL_DIR, exist_ok=True)
+    fields = list(dict.fromkeys(k for r in rows for k in r))
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(allrows)
+        w.writerows(rows)
 
-    def fmt(v, spec):
+    def fmt(v, spec_):
         try:
-            return format(float(v), spec)
+            return format(float(v), spec_)
         except (TypeError, ValueError):
-            return "-"
+            return "-".rjust(int(spec_.split(".")[0]))
 
-    log("\n" + "=" * 112)
+    log("\n" + "=" * 100)
     log(f"SUMMARY {args.predictor}  (logic only; SRAM energy needs CACTI)   {out_csv}")
-    log("=" * 112)
-    log(f"{'budget':>7s} {'rtl':>5s} {'MPKBr':>7s} {'area um2':>9s} {'flops':>6s} {'WNS':>9s} "
-        f"{'P uW':>8s} {'cyc/br':>7s} {'pJ/br':>7s} {'rd/br':>6s} {'wr/br':>6s}  gls  crit path")
-    for r in allrows:
-        crit = f"{r.get('crit_start') or '-'} -> {r.get('crit_end') or '-'}"
-        log(f"{r['budget']:>7s} {r.get('rtl_pass') or '-':>5s} {fmt(r.get('mpkbr_geomean'), '7.2f')} "
-            f"{fmt(r.get('area_um2'), '9.2f')} {fmt(r.get('flops'), '6.0f')} {fmt(r.get('wns'), '9.1f')} "
-            f"{fmt((float(r['p_total_w']) * 1e6) if r.get('p_total_w') not in (None, '') else None, '8.2f')} "
-            f"{fmt(r.get('cycles_per_cond'), '7.3f')} {fmt(r.get('e_logic_pj_per_cond'), '7.3f')} "
-            f"{fmt(r.get('sram_rd_per_cond'), '6.3f')} {fmt(r.get('sram_wr_per_cond'), '6.3f')}  "
-            f"{str(r.get('gls_pass') or '-'):4s} {crit}")
+    log("=" * 100)
+    log(f"{'budget':>7s} {'trace':>14s} {'rtl':>5s} {'MPKBr':>7s} {'area um2':>9s} {'flops':>6s} "
+        f"{'WNS':>8s} {'gls':>5s} {'P uW':>8s} {'cyc/br':>7s} {'pJ/br':>7s}")
+    for r in rows:
+        p_uw = float(r["p_total_w"]) * 1e6 if r.get("p_total_w") not in ("", None) else None
+        log(f"{r['budget']:>7s} {r['trace'][:14]:>14s} {str(r.get('rtl_pass') or '-'):>5s} "
+            f"{fmt(r.get('mpkbr'), '7.2f')} {fmt(r.get('area_um2'), '9.1f')} "
+            f"{fmt(r.get('flops'), '6.0f')} {fmt(r.get('wns'), '8.1f')} "
+            f"{str(r.get('gls_pass') or '-'):>5s} {fmt(p_uw, '8.2f')} "
+            f"{fmt(r.get('cycles_per_cond'), '7.3f')} {fmt(r.get('e_logic_pj_per_cond'), '7.3f')}")
 
 
 if __name__ == "__main__":
