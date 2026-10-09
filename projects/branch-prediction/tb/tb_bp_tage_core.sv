@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Description:
-//   Self-checking testbench for bp_tage_core. The stimulus, prediction check,
-//   drain and report come from tb_bp_common.svh (golden dump of the patched
-//   CBP5 harness, +STIM=<path>). The banks are behavioral bp_sram models
-//   instantiated here, next to dut (instance name dut, the synthesized unit).
+//   Self-checking testbench for bp_tage_core (direct-mapped). The stimulus,
+//   prediction check, drain and report come from tb_bp_common.svh (golden
+//   dump of the patched CBP5 harness, +STIM=<path>). The banks are
+//   behavioral bp_sram models instantiated here, next to dut (instance name
+//   dut, the synthesized unit).
 //
 //   State trace (+STATE=<path> or STATE_FILE): the file tage_cb.h writes when
 //   run with TAGE_CB_STATE=<path>, one line per UpdatePredictor (kind 1) /
@@ -26,17 +27,17 @@
 //   TB_STATE_LINES / TB_STATE_CKSUMS are printed at the end. With no state
 //   file only the predictions are checked.
 //
-//   Parameters must match the dump's tage_cb build; T<i>_HIST are the
-//   PREDICTOR_HIST_LENS values of its CBP5 .log.
+//   Parameters must match the dump's tage_cb build (LOGASSOC=0); T<i>_HIST
+//   are the PREDICTOR_HIST_LENS values of its CBP5 .log.
 //
 // Parameters:
-//   NHIST, LOGT, LOGASSOC, LOGB, TBITS, CB_LMP, ILEN_CAP, T1_HIST..T14_HIST
+//   NHIST, LOGT, LOGB, TBITS, CB_LMP, ILEN_CAP, T1_HIST..T14_HIST
 //                    - as bp_tage_core
 //   STIM_FILE        - default golden dump ("" = +STIM=<path> required)
 //   STATE_FILE       - default state trace ("" = +STATE=<path> or none)
 //   MAX_LINES        - stop after this many branch lines (0 = whole file)
 //   TIMEOUT_CYCLES   - max cycles to wait for a ready or valid (a u-reset
-//                      sweep alone takes 2^LOGG + 1 cycles)
+//                      sweep alone takes 2^LOGT + 1 cycles)
 // -----------------------------------------------------------------------------
 
 `timescale 1 ns/1 ps
@@ -57,7 +58,6 @@
 module tb_bp_tage_core #(
     parameter int unsigned NHIST          = 12,
     parameter int unsigned LOGT           = 6,
-    parameter int unsigned LOGASSOC       = 0,
     parameter int unsigned LOGB           = 11,
     parameter int unsigned TBITS          = 10,
     parameter int unsigned CB_LMP         = 0,
@@ -85,16 +85,14 @@ module tb_bp_tage_core #(
     localparam int unsigned PC_W     = 64;
     localparam string       DUT_NAME = "bp_tage_core";
 
-    localparam int unsigned LOGG     = LOGT - LOGASSOC;
-    localparam int unsigned ASSOC    = 1 << LOGASSOC;
     localparam int unsigned SH_OFF   = 2 * ((NHIST / 2 + 1) / 2);
     localparam int unsigned SH_N     = NHIST - SH_OFF;
     localparam int unsigned NDPAIR   = SH_N / 2;
-    localparam int unsigned NB0      = NDPAIR + SH_OFF / 2;       // way-0 banks (2 entries)
-    localparam int unsigned NB       = NB0 + ((LOGASSOC != 0) ? NHIST : 0);
+    localparam int unsigned NB       = NDPAIR + SH_OFF / 2;       // banks, 2 entries per row
     localparam int unsigned E_W      = TBITS + 5;
-    localparam int unsigned DATA_W   = (2 * NB0 + ((LOGASSOC != 0) ? NHIST : 0)) * E_W;
-    localparam int unsigned ROWS     = 1 << LOGG;
+    localparam int unsigned ROW_W    = 2 * E_W;
+    localparam int unsigned DATA_W   = NB * ROW_W;
+    localparam int unsigned ROWS     = 1 << LOGT;
     localparam int unsigned BIM_N    = 1 << LOGB;
     localparam int unsigned HYS_N    = 1 << (LOGB - 1);
 
@@ -115,16 +113,9 @@ module tb_bp_tage_core #(
     logic [       PC_W-1:0]   upd_target;
 
     logic [NB-1:0]            tb_re, tb_we;
-    logic [NB-1:0][ LOGG-1:0] tb_raddr, tb_waddr;
+    logic [NB-1:0][ LOGT-1:0] tb_raddr, tb_waddr;
     logic [     DATA_W-1:0]   tb_rdata, tb_wdata;
 
-    // bank b's data in the tb_* data vectors, and its width
-    function automatic int unsigned d_off(input int unsigned b);
-        d_off = (b < NB0) ? (2 * b * E_W) : (2 * NB0 * E_W + (b - NB0) * E_W);
-    endfunction
-    function automatic int unsigned b_w(input int unsigned b);
-        b_w = (b < NB0) ? 2 * E_W : E_W;
-    endfunction
     logic                     bp_re, bp_we, bp_rdata, bp_wdata;
     logic [       LOGB-1:0]   bp_raddr, bp_waddr;
     logic                     bh_re, bh_we;
@@ -142,7 +133,6 @@ module tb_bp_tage_core #(
     bp_tage_core #(
         .NHIST            (NHIST),
         .LOGT             (LOGT),
-        .LOGASSOC         (LOGASSOC),
         .LOGB             (LOGB),
         .TBITS            (TBITS),
         .CB_LMP           (CB_LMP),
@@ -200,15 +190,15 @@ module tb_bp_tage_core #(
     for (genvar b = 0; b < NB; b++) begin : g_tb
         bp_sram #(
             .DEPTH(ROWS),
-            .WIDTH(b_w(b))
+            .WIDTH(ROW_W)
         ) i_tb (
             .clk_i  (clk_i),
             .re_i   (tb_re[b]),
             .raddr_i(tb_raddr[b]),
-            .rdata_o(tb_rdata[d_off(b) +: b_w(b)]),
+            .rdata_o(tb_rdata[b * ROW_W +: ROW_W]),
             .we_i   (tb_we[b]),
             .waddr_i(tb_waddr[b]),
-            .wdata_i(tb_wdata[d_off(b) +: b_w(b)])
+            .wdata_i(tb_wdata[b * ROW_W +: ROW_W])
         );
     end
 
@@ -247,15 +237,14 @@ module tb_bp_tage_core #(
     // Hooks for tb_bp_common.svh
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("NHIST=%0d LOGT=%0d LOGASSOC=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d banks=%0d x %0d rows (way 0: %0d x %0d bits, way 1: %0d x %0d bits)",
-                         NHIST, LOGT, LOGASSOC, LOGB, TBITS, CB_LMP, NB, ROWS, NB0, 2 * E_W, NB - NB0, E_W);
+        return $sformatf("NHIST=%0d LOGT=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d banks=%0d x %0d rows x %0d bits",
+                         NHIST, LOGT, LOGB, TBITS, CB_LMP, NB, ROWS, ROW_W);
     endfunction
 
     function automatic string tb_debug();
 `ifndef POST_SYN_SIM
-        return $sformatf("hit %0d.%0d alt %0d.%0d hc %0d.%0d weak %0d numero %0d pcblock %h seed %h",
-                         dut.p_hit, dut.p_hw, dut.p_alt, dut.p_aw, dut.p_hc, dut.p_cw,
-                         dut.p_pweak, dut.num_q, dut.pcb_q, dut.seed_q);
+        return $sformatf("hit %0d alt %0d hc %0d weak %0d numero %0d pcblock %h seed %h",
+                         dut.p_hit, dut.p_alt, dut.p_hc, dut.p_pweak, dut.num_q, dut.pcb_q, dut.seed_q);
 `else
         return "";
 `endif
@@ -266,7 +255,7 @@ module tb_bp_tage_core #(
     // -------------------------------------------------------------------------
     // Shadow copy of every table, from the SRAM write ports (for the checksum)
     // -------------------------------------------------------------------------
-    logic [2*E_W-1:0] sh_tb [NB][ROWS];   // way-1 banks: low E_W bits
+    logic [ROW_W-1:0] sh_tb [NB][ROWS];
     logic             sh_bp [BIM_N];
     logic [      1:0] sh_bh [HYS_N];
 
@@ -279,9 +268,7 @@ module tb_bp_tage_core #(
 
     always @(posedge clk_i) begin
         for (int unsigned b = 0; b < NB; b++)
-            if (tb_we[b])
-                sh_tb[b][tb_waddr[b]] <= (2 * E_W)'((tb_wdata >> d_off(b))
-                                                    & (((DATA_W)'(1) << b_w(b)) - (DATA_W)'(1)));
+            if (tb_we[b]) sh_tb[b][tb_waddr[b]] <= tb_wdata[b * ROW_W +: ROW_W];
         if (bp_we) sh_bp[bp_waddr] <= bp_wdata;
         if (bh_we) sh_bh[bh_waddr] <= bh_wdata;
     end
@@ -289,38 +276,26 @@ module tb_bp_tage_core #(
     // tage_cb.h table_checksum(): order-independent, mod 2^32
     //   sum ((tag << 5) | (u << 3) | ctr) * (2 * ((array << 20) | entry) + 1)
     //   + sum (pred | hyst << 1) * (2 * (((NARRAYS + 1) << 20) | i) + 1)
-    // C++ entry = row * ASSOC + way, row = (half row << 1) | half for the
+    // C++ entry = row (ASSOC = 1); row = (half row << 1) | half for the
     // doubled arrays.
     function automatic int unsigned table_checksum();
         int unsigned c;
         c = 0;
         for (int unsigned b = 0; b < NB; b++) begin
             for (int unsigned r = 0; r < ROWS; r++) begin
-                for (int unsigned s = 0; s < ((b < NB0) ? 2 : 1); s++) begin
+                for (int unsigned s = 0; s < 2; s++) begin
                     logic [E_W-1:0] e;
-                    int unsigned    a, rowf, way, v;
+                    int unsigned    a, rowf, v;
                     e = sh_tb[b][r][s*E_W +: E_W];
-                    if (b < NB0) begin
-                        way = 0;
-                        if (b < 2 * NDPAIR) begin
-                            a    = 2 * (b / 2 + 1) - 1 + s;    // doubled pair, half b % 2
-                            rowf = (r << 1) | (b % 2);
-                        end else begin
-                            a    = 2 * (b - NDPAIR + 1) - 1 + s;
-                            rowf = r;
-                        end
+                    if (b < 2 * NDPAIR) begin
+                        a    = 2 * (b / 2 + 1) - 1 + s;    // doubled pair, half b % 2
+                        rowf = (r << 1) | (b % 2);
                     end else begin
-                        way = 1;
-                        if (b - NB0 < 2 * SH_N) begin
-                            a    = (b - NB0) / 2 + 1;           // doubled array, half
-                            rowf = (r << 1) | ((b - NB0) % 2);
-                        end else begin
-                            a    = b - NB0 - SH_N + 1;
-                            rowf = r;
-                        end
+                        a    = 2 * (b - NDPAIR + 1) - 1 + s;
+                        rowf = r;
                     end
                     v = (32'(e[E_W-1:5]) << 5) | (32'(e[4:3]) << 3) | 32'(e[2:0]);
-                    c += v * (2 * ((a << 20) | (rowf * ASSOC + way)) + 1);
+                    c += v * (2 * ((a << 20) | rowf) + 1);
                 end
             end
         end
