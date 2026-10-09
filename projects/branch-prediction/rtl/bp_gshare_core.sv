@@ -15,10 +15,9 @@
 //   (gshare.h FoldHistory); for GHR_BITS <= INDEX_BITS it is the GHR itself.
 //   Prediction = MSB of the counter (counter > 1 for 2 bits, as gshare.h).
 //
-//   State kept between predict and update (project-wide rule): the computed
-//   index and small decision values live in flops; table contents are
-//   re-read from the SRAM at update time. For gshare: idx_q in flops, the
-//   counter re-read.
+//   Predict -> update checkpoint (flops): the PHT index (idx_q) and the
+//   counter read at predict time (ctr_q). The update does not re-read the
+//   PHT: one read per conditional branch.
 //
 //   Protocol (stage 1: non-speculative, ONE branch in flight, as the CBP5
 //   harness calls GetPrediction and UpdatePredictor back to back):
@@ -27,23 +26,26 @@
 //                  (upd_is_cond_i = 0, CBP5 TrackOtherInst) is also accepted
 //                  here; gshare ignores it, as gshare.h does.
 //     S_PRED     - the read data is valid: pred_resp_valid_o = 1 for one
-//                  cycle, pred_resp_taken_o is the prediction.
+//                  cycle, pred_resp_taken_o is the prediction, and the
+//                  counter is latched into ctr_q.
 //     S_WAIT_UPD - waits for the CONDITIONAL update (upd_is_cond_i = 1) of
-//                  the same branch. Its handshake re-reads the PHT at idx_q
-//                  and latches the resolved direction.
-//     S_UPD      - the re-read counter is valid: the saturated counter is
-//                  written back to idx_q and the resolved direction is
-//                  shifted into the GHR.
-//   A conditional branch takes 4 cycles (2 PHT reads, 1 PHT write); an
+//                  the same branch. In its handshake cycle the saturated
+//                  counter is written to idx_q and the resolved direction is
+//                  shifted into the GHR; then back to S_IDLE.
+//   The write is skipped when the counter does not change (already saturated
+//   in the resolved direction). A conditional branch takes 3 cycles with
+//   back-to-back handshakes (1 PHT read, at most 1 PHT write); an
 //   unconditional one takes 1.
 //
-//   The re-read returns what gshare.h reads in UpdatePredictor: with one
-//   branch in flight nothing writes that entry in between, and the GHR (hence
-//   the index) only changes at the end of the update.
+//   Bit-exact with gshare.h: with one branch in flight nothing writes the
+//   entry between predict and update, so ctr_q is what UpdatePredictor reads,
+//   and the GHR (hence the index) only changes in the update cycle. A skipped
+//   write would have stored the value the entry already holds.
 //
-//   Not modeled (stage 1): speculative history update, a PHT init FSM (the
-//   SRAM model starts at weakly taken, as gshare.h's constructor), skipping
-//   the write when the counter does not change.
+//   Not modeled (stage 1): speculative history update; several branches in
+//   flight (ctr_q would go stale if an older in-flight branch updated the
+//   same entry); a PHT init FSM (the SRAM model starts at weakly taken, as
+//   gshare.h's constructor).
 //
 //   Interface signals gshare does not use (upd_pc_i, upd_target_i, the upper
 //   PC bits) are kept so all four predictor cores share one interface.
@@ -115,14 +117,13 @@ module bp_gshare_core #(
     typedef enum logic [1:0] {
         S_IDLE     = 2'd0,
         S_PRED     = 2'd1,
-        S_WAIT_UPD = 2'd2,
-        S_UPD      = 2'd3
+        S_WAIT_UPD = 2'd2
     } state_e;
 
     state_e                state_q, state_d;
     logic [  GHR_BITS-1:0] ghr_q;     // global history, newest outcome in bit 0
-    logic [INDEX_BITS-1:0] idx_q;     // PHT index of the branch in flight
-    logic                  taken_q;   // its resolved direction
+    logic [INDEX_BITS-1:0] idx_q;     // checkpoint: PHT index of the branch in flight
+    logic [  CTR_BITS-1:0] ctr_q;     // checkpoint: its counter as read at predict
 
     // -------------------------------------------------------------------------
     // Index: inline history fold (gshare.h FoldHistory) XOR shifted PC
@@ -156,21 +157,25 @@ module bp_gshare_core #(
     assign upd_cond_fire = upd_valid_i && upd_is_cond_i && (state_q == S_WAIT_UPD);
 
     // -------------------------------------------------------------------------
-    // PHT access: read at predict and again at update, write after the re-read
+    // PHT access: read at predict only; write in the update-handshake cycle
+    // from the checkpointed counter, skipped when the counter does not change
     // -------------------------------------------------------------------------
-    assign pht_re_o    = pred_fire || upd_cond_fire;
-    assign pht_raddr_o = pred_fire ? pred_idx : idx_q;
-    assign pht_we_o    = (state_q == S_UPD);
-    assign pht_waddr_o = idx_q;
+    logic [CTR_BITS-1:0] ctr_upd;
 
     bp_sat_ctr #(
         .WIDTH (CTR_BITS),
         .SIGNED(1'b0)
     ) i_sat_ctr (
-        .ctr_i (pht_rdata_i),
-        .inc_i (taken_q),
-        .ctr_o (pht_wdata_o)
+        .ctr_i (ctr_q),
+        .inc_i (upd_taken_i),
+        .ctr_o (ctr_upd)
     );
+
+    assign pht_re_o    = pred_fire;
+    assign pht_raddr_o = pred_idx;
+    assign pht_we_o    = upd_cond_fire && (ctr_upd != ctr_q);
+    assign pht_waddr_o = idx_q;
+    assign pht_wdata_o = ctr_upd;
 
     // -------------------------------------------------------------------------
     // Control
@@ -180,8 +185,7 @@ module bp_gshare_core #(
         case (state_q)
             S_IDLE:     if (pred_fire)     state_d = S_PRED;
             S_PRED:                        state_d = S_WAIT_UPD;
-            S_WAIT_UPD: if (upd_cond_fire) state_d = S_UPD;
-            S_UPD:                         state_d = S_IDLE;
+            S_WAIT_UPD: if (upd_cond_fire) state_d = S_IDLE;
             default:                       state_d = S_IDLE;
         endcase
     end
@@ -194,14 +198,14 @@ module bp_gshare_core #(
         end else begin
             state_q <= state_d;
             // shift in the resolved direction; truncation keeps GHR_BITS bits
-            if (state_q == S_UPD) ghr_q <= GHR_BITS'({ghr_q, taken_q});
+            if (upd_cond_fire) ghr_q <= GHR_BITS'({ghr_q, upd_taken_i});
         end
     end
 
-    // Datapath registers: no reset (always written before they are used).
+    // Checkpoint registers: no reset (always written before they are used).
     always_ff @(posedge clk_i) begin
-        if (pred_fire)     idx_q   <= pred_idx;
-        if (upd_cond_fire) taken_q <= upd_taken_i;
+        if (pred_fire)           idx_q <= pred_idx;
+        if (state_q == S_PRED)   ctr_q <= pht_rdata_i;
     end
 
     // -------------------------------------------------------------------------
