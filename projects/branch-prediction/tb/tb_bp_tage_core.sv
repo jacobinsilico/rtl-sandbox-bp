@@ -86,11 +86,14 @@ module tb_bp_tage_core #(
     localparam string       DUT_NAME = "bp_tage_core";
 
     localparam int unsigned LOGG     = LOGT - LOGASSOC;
+    localparam int unsigned ASSOC    = 1 << LOGASSOC;
     localparam int unsigned SH_OFF   = 2 * ((NHIST / 2 + 1) / 2);
-    localparam int unsigned NDPAIR   = (NHIST - SH_OFF) / 2;
-    localparam int unsigned NB       = NDPAIR + SH_OFF / 2;
+    localparam int unsigned SH_N     = NHIST - SH_OFF;
+    localparam int unsigned NDPAIR   = SH_N / 2;
+    localparam int unsigned NB0      = NDPAIR + SH_OFF / 2;       // way-0 banks (2 entries)
+    localparam int unsigned NB       = NB0 + ((LOGASSOC != 0) ? NHIST : 0);
     localparam int unsigned E_W      = TBITS + 5;
-    localparam int unsigned ROW_W    = 2 * E_W;
+    localparam int unsigned DATA_W   = (2 * NB0 + ((LOGASSOC != 0) ? NHIST : 0)) * E_W;
     localparam int unsigned ROWS     = 1 << LOGG;
     localparam int unsigned BIM_N    = 1 << LOGB;
     localparam int unsigned HYS_N    = 1 << (LOGB - 1);
@@ -113,7 +116,15 @@ module tb_bp_tage_core #(
 
     logic [NB-1:0]            tb_re, tb_we;
     logic [NB-1:0][ LOGG-1:0] tb_raddr, tb_waddr;
-    logic [NB-1:0][ROW_W-1:0] tb_rdata, tb_wdata;
+    logic [     DATA_W-1:0]   tb_rdata, tb_wdata;
+
+    // bank b's data in the tb_* data vectors, and its width
+    function automatic int unsigned d_off(input int unsigned b);
+        d_off = (b < NB0) ? (2 * b * E_W) : (2 * NB0 * E_W + (b - NB0) * E_W);
+    endfunction
+    function automatic int unsigned b_w(input int unsigned b);
+        b_w = (b < NB0) ? 2 * E_W : E_W;
+    endfunction
     logic                     bp_re, bp_we, bp_rdata, bp_wdata;
     logic [       LOGB-1:0]   bp_raddr, bp_waddr;
     logic                     bh_re, bh_we;
@@ -189,15 +200,15 @@ module tb_bp_tage_core #(
     for (genvar b = 0; b < NB; b++) begin : g_tb
         bp_sram #(
             .DEPTH(ROWS),
-            .WIDTH(ROW_W)
+            .WIDTH(b_w(b))
         ) i_tb (
             .clk_i  (clk_i),
             .re_i   (tb_re[b]),
             .raddr_i(tb_raddr[b]),
-            .rdata_o(tb_rdata[b]),
+            .rdata_o(tb_rdata[d_off(b) +: b_w(b)]),
             .we_i   (tb_we[b]),
             .waddr_i(tb_waddr[b]),
-            .wdata_i(tb_wdata[b])
+            .wdata_i(tb_wdata[d_off(b) +: b_w(b)])
         );
     end
 
@@ -236,15 +247,15 @@ module tb_bp_tage_core #(
     // Hooks for tb_bp_common.svh
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("NHIST=%0d LOGT=%0d LOGASSOC=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d banks=%0d x %0d x %0d",
-                         NHIST, LOGT, LOGASSOC, LOGB, TBITS, CB_LMP, NB, ROWS, ROW_W);
+        return $sformatf("NHIST=%0d LOGT=%0d LOGASSOC=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d banks=%0d x %0d rows (way 0: %0d x %0d bits, way 1: %0d x %0d bits)",
+                         NHIST, LOGT, LOGASSOC, LOGB, TBITS, CB_LMP, NB, ROWS, NB0, 2 * E_W, NB - NB0, E_W);
     endfunction
 
     function automatic string tb_debug();
 `ifndef POST_SYN_SIM
-        return $sformatf("hit %0d alt %0d hc %0d weak %0d numero %0d pcblock %h seed %h",
-                         dut.p_hit, dut.p_alt, dut.p_hc, dut.p_pweak, dut.num_q, dut.pcb_q,
-                         dut.seed_q);
+        return $sformatf("hit %0d.%0d alt %0d.%0d hc %0d.%0d weak %0d numero %0d pcblock %h seed %h",
+                         dut.p_hit, dut.p_hw, dut.p_alt, dut.p_aw, dut.p_hc, dut.p_cw,
+                         dut.p_pweak, dut.num_q, dut.pcb_q, dut.seed_q);
 `else
         return "";
 `endif
@@ -255,7 +266,7 @@ module tb_bp_tage_core #(
     // -------------------------------------------------------------------------
     // Shadow copy of every table, from the SRAM write ports (for the checksum)
     // -------------------------------------------------------------------------
-    logic [ROW_W-1:0] sh_tb [NB][ROWS];
+    logic [2*E_W-1:0] sh_tb [NB][ROWS];   // way-1 banks: low E_W bits
     logic             sh_bp [BIM_N];
     logic [      1:0] sh_bh [HYS_N];
 
@@ -268,7 +279,9 @@ module tb_bp_tage_core #(
 
     always @(posedge clk_i) begin
         for (int unsigned b = 0; b < NB; b++)
-            if (tb_we[b]) sh_tb[b][tb_waddr[b]] <= tb_wdata[b];
+            if (tb_we[b])
+                sh_tb[b][tb_waddr[b]] <= (2 * E_W)'((tb_wdata >> d_off(b))
+                                                    & (((DATA_W)'(1) << b_w(b)) - (DATA_W)'(1)));
         if (bp_we) sh_bp[bp_waddr] <= bp_wdata;
         if (bh_we) sh_bh[bh_waddr] <= bh_wdata;
     end
@@ -276,24 +289,38 @@ module tb_bp_tage_core #(
     // tage_cb.h table_checksum(): order-independent, mod 2^32
     //   sum ((tag << 5) | (u << 3) | ctr) * (2 * ((array << 20) | entry) + 1)
     //   + sum (pred | hyst << 1) * (2 * (((NARRAYS + 1) << 20) | i) + 1)
+    // C++ entry = row * ASSOC + way, row = (half row << 1) | half for the
+    // doubled arrays.
     function automatic int unsigned table_checksum();
         int unsigned c;
         c = 0;
         for (int unsigned b = 0; b < NB; b++) begin
             for (int unsigned r = 0; r < ROWS; r++) begin
-                for (int unsigned s = 0; s < 2; s++) begin
+                for (int unsigned s = 0; s < ((b < NB0) ? 2 : 1); s++) begin
                     logic [E_W-1:0] e;
-                    int unsigned    a, idx, v;
+                    int unsigned    a, rowf, way, v;
                     e = sh_tb[b][r][s*E_W +: E_W];
-                    if (b < 2 * NDPAIR) begin
-                        a   = 2 * (b / 2 + 1) - 1 + s;    // doubled pair, half b % 2
-                        idx = (r << 1) | (b % 2);
+                    if (b < NB0) begin
+                        way = 0;
+                        if (b < 2 * NDPAIR) begin
+                            a    = 2 * (b / 2 + 1) - 1 + s;    // doubled pair, half b % 2
+                            rowf = (r << 1) | (b % 2);
+                        end else begin
+                            a    = 2 * (b - NDPAIR + 1) - 1 + s;
+                            rowf = r;
+                        end
                     end else begin
-                        a   = 2 * (b - NDPAIR + 1) - 1 + s;
-                        idx = r;
+                        way = 1;
+                        if (b - NB0 < 2 * SH_N) begin
+                            a    = (b - NB0) / 2 + 1;           // doubled array, half
+                            rowf = (r << 1) | ((b - NB0) % 2);
+                        end else begin
+                            a    = b - NB0 - SH_N + 1;
+                            rowf = r;
+                        end
                     end
                     v = (32'(e[E_W-1:5]) << 5) | (32'(e[4:3]) << 3) | 32'(e[2:0]);
-                    c += v * (2 * ((a << 20) | idx) + 1);
+                    c += v * (2 * ((a << 20) | (rowf * ASSOC + way)) + 1);
                 end
             end
         end

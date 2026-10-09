@@ -18,13 +18,17 @@
 //   Sampled at the falling edge (bench inputs and DUT state both stable): a
 //   conditional line is checked when the core is idle again after its
 //   update, an unconditional line at its handshake (the core ignores it).
-//   The first difference is fatal (branch number and every differing
-//   field). Compared:
-//     always    kind, train (a write-back happened), and the weight checksum
-//               when ckv = 1 (on a shadow copy of every table kept from the
-//               write ports, so it also runs on the netlist)
-//     RTL only  pred, sum, bias / table indices, theta, tc, path history,
-//               global history (newest min(64, longest history) bits)
+//   Table writes are collected from the update handshake until then. The
+//   first difference is fatal (branch number and every differing field).
+//   Compared:
+//     always    kind; no table written for a branch the reference did not
+//               train (the core skips writes of unchanged weights, so a
+//               write is no longer a stand-in for training); the weight
+//               checksum when ckv = 1 (on a shadow copy of every table kept
+//               from the write ports, so it also runs on the netlist)
+//     RTL only  train (dut.train at the update handshake), pred, sum, bias /
+//               table indices, theta, tc, path history, global history
+//               (newest min(64, longest history) bits)
 //   With no state file only the predictions are checked.
 //
 //   Parameters must match the dump's hashed_perceptron build; T<i>_HIST are
@@ -210,8 +214,8 @@ module tb_bp_hp_core #(
         .HP_PATH_BITS      (HP_PATH_BITS),
         .HP_PCMIX          (HP_PCMIX),
         .HP_PC_SHIFT       (HP_PC_SHIFT),
-        .Y_REG            (Y_REG),
-        .PC_W             (PC_W)
+        .Y_REG             (Y_REG),
+        .PC_W              (PC_W)
     ) dut (
 `endif
         .clk_i            (clk_i),
@@ -334,14 +338,15 @@ module tb_bp_hp_core #(
     longint unsigned st_lines  = 0;
     longint unsigned st_cksums = 0;
     logic            pend_cond = 1'b0;   // conditional update in progress
-    logic            saw_wr    = 1'b0;   // ... and it wrote the tables
+    logic            saw_wr    = 1'b0;   // ... and it wrote a table
+    logic            train_rtl = 1'b0;   // ... and the core trained (RTL only)
 
     function automatic void chk(inout string bad, input string name, input longint rtl,
                                 input longint ref_v);
         if (rtl != ref_v) bad = {bad, $sformatf(" %s rtl=%0d ref=%0d", name, rtl, ref_v)};
     endfunction
 
-    task automatic check_state(input logic kind_rtl, input logic train_rtl);
+    task automatic check_state(input logic kind_rtl, input logic train_rtl_i, input logic wrote);
         string           line;
         string           bad;
         int              nf;
@@ -365,9 +370,10 @@ module tb_bp_hp_core #(
 
         bad = "";
         chk(bad, "kind", longint'(kind_rtl), longint'(f_kind));
-        if (kind_rtl) chk(bad, "train", longint'(train_rtl), longint'(f_train));
+        if (kind_rtl && wrote && f_train == 0) bad = {bad, " table written without training"};
 `ifndef POST_SYN_SIM
         if (kind_rtl) begin
+            chk(bad, "train", longint'(train_rtl_i), longint'(f_train));
             chk(bad, "pred", longint'(~dut.y_q[$bits(dut.y_q)-1]), longint'(f_pred));
             chk(bad, "sum",  longint'($signed(dut.y_q)),           longint'(f_sum));
             chk(bad, "bidx", longint'(dut.bidx_q),                 longint'(f_bidx));
@@ -405,20 +411,28 @@ module tb_bp_hp_core #(
 
     // Falling edge: the bench drives its inputs T_SETTLE after the rising
     // edge and the DUT changes only on rising edges, so both are stable here.
+    // A conditional update is checked once the core is idle again; its table
+    // writes are collected from its handshake cycle on (the core writes in
+    // that cycle; an older core wrote one cycle later, also collected).
     always @(negedge clk_i) begin
         if (counting && st_fd != 0) begin
-            if (pend_cond) begin
-                if (bias_we) saw_wr = 1'b1;
-                if (pred_req_ready) begin            // update finished
-                    check_state(1'b1, saw_wr);
-                    pend_cond = 1'b0;
-                    saw_wr    = 1'b0;
-                end
+            if (pend_cond && pred_req_ready) begin   // update finished
+                check_state(1'b1, train_rtl, saw_wr);
+                pend_cond = 1'b0;
+                saw_wr    = 1'b0;
+                train_rtl = 1'b0;
             end
             if (upd_valid && upd_ready) begin        // handshake on the next edge
-                if (upd_is_cond) pend_cond = 1'b1;
-                else             check_state(1'b0, 1'b0);
+                if (upd_is_cond) begin
+                    pend_cond = 1'b1;
+`ifndef POST_SYN_SIM
+                    train_rtl = dut.train;
+`endif
+                end else begin
+                    check_state(1'b0, 1'b0, 1'b0);
+                end
             end
+            if (pend_cond && (bias_we || (|wt_we))) saw_wr = 1'b1;
         end
     end
 

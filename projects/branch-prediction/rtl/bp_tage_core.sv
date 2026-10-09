@@ -5,9 +5,10 @@
 // Description:
 //   Cookbook TAGE predictor core ("TAGE: an engineering cookbook", Seznec,
 //   INRIA RR-9561, 2024), bit-exact with tage_cb.h built with CB_SC=0,
-//   AHEAD=0, CB_OPTTAGE=1, CB_ILEN_CAP=1 (STATIC_TARGET_FIX=1 traces). This
-//   is the unit that is synthesized; every table is an SRAM outside it and
-//   the SRAM ports are its I/O. Stage 1: direct-mapped (LOGASSOC = 0) only.
+//   AHEAD=0, CB_OPTTAGE=1, CB_ILEN_CAP=1, LOGASSOC=0 (direct-mapped tagged
+//   tables; STATIC_TARGET_FIX=1 traces). This is the unit that is
+//   synthesized; every table is an SRAM outside it and the SRAM ports are
+//   its I/O.
 //
 //   Block-based prediction: a fetch block ends at a taken branch or after 4
 //   branches. The index of every odd logical table and the tag of every
@@ -15,34 +16,52 @@
 //   held in flops; branch number Numero (num_q) is XORed in per branch. The
 //   branch PC itself is not used.
 //
-//   Storage (C++ arrays -> banks). CB_ADJACENT: T(2k-1) and T(2k) share an
-//   index, so their entries sit side by side in one row (low entry = odd
-//   table). CB_SHARED: the first NHIST-SH_OFF arrays are doubled and shared
-//   with T(i+SH_OFF); the doubled arrays are split into two banks by the
-//   index LSB (X for the low tables, X^1 for their partners), so both are
-//   read in one cycle. Bank order: doubled pairs (half 0, half 1), then the
-//   other pairs. Entry = {tag, u[1:0], ctr[2:0]} (ctr two's complement).
+//   Storage (C++ arrays -> banks). CB_ADJACENT gives T(2k-1) and T(2k) the
+//   same index, so their entries sit side by side in one row (low entry =
+//   odd table). CB_SHARED: the doubled arrays are split into two banks by
+//   the index LSB (X for the low tables, X^1 for their partners
+//   T(i+SH_OFF)), so both are read in one cycle. NB banks of 2^LOGT rows,
+//   2 entries per row; entry = {tag, u[1:0], ctr[2:0]} (ctr two's
+//   complement); bank b's data in the tb_* data vectors: [2*b*E_W +: 2*E_W].
+//   Within one branch every bank is accessed at one row only (its branch
+//   row baddr), apart from the u-reset sweep.
 //   Bimodal: pred bits (2^LOGB x 1) and hysteresis (2^(LOGB-1) x 2).
 //
+//   SRAM read data is used only in the cycle right after its read (no
+//   reliance on a macro holding its output). What the update needs later
+//   comes from the predict -> update checkpoint (flops), latched in S_PRED:
+//     ck_row_q  the provider's row (both entries, 2 x E_W bits): the
+//               provider update (counter + u) is a read-modify-write of
+//               that row; valid until a write of this update hits the
+//               provider's bank (then the row is read again)
+//     ck_bp_q, ck_bh_q  the bimodal entry (pred bit, hysteresis): the
+//               bimodal is written at most once per update, never re-read
+//   plus the prediction decisions (provider, alternate, HCpred, ...).
+//
 //   Protocol (non-speculative, one branch in flight, as gshare):
-//     S_IDLE  predict handshake reads every bank -> S_PRED (response), or an
-//             unconditional update (TrackOtherInst) -> S_HIST.
+//     S_IDLE  predict handshake reads every bank -> S_PRED (response,
+//             checkpoint), or an unconditional update (TrackOtherInst)
+//             -> S_HIST.
 //     S_WAIT  conditional update handshake -> the update FSM, which mirrors
 //             UpdatePredictorCore statement by statement, one MYRANDOM call
-//             per cycle at most. Table contents are re-read at update:
-//             every bank is marked stale at the handshake and re-read on
-//             first use (and after each write to it, so read-modify-writes
-//             of a shared row always see the previous write).
+//             per cycle at most.
+//     S_AW    allocation into table i: its bank is read, and MYRANDOM is
+//             called for j (ASSOC = 1); S_AWD: u == 0 -> the new entry is
+//             written, else FORCEU (MYRANDOM, maybe clear u) and Penalty.
+//     S_F_ALT, S_F_HC (UPDATEALT) and S_F_PROV without a valid checkpoint
+//             read their bank first (one extra cycle), then write.
 //     S_SWEEP the global u decrement (TICK >= 4096): all banks, one row per
-//             cycle, read/write pipelined; 2^LOGG + 1 cycles.
+//             cycle, read/write pipelined; 2^LOGT + 1 cycles. A row is
+//             written only if one of its entries has u > 0.
 //     S_HIST  history update (block end: path history, 4 global history
 //             bits, folded histories) -> S_HASH (block hash) -> S_IDLE.
+//   An entry or bimodal write is skipped when it would store the value the
+//   SRAM already holds (saturated counter, unchanged u).
 //   upd_ready_o / pred_req_ready_o are low while the update runs.
 //
 // Parameters:
 //   NHIST              - logical tagged tables (even, 4..14)
-//   LOGT               - log2 entries of a logical table (C++ LOGT)
-//   LOGASSOC           - 0 (stage 1)
+//   LOGT               - log2 entries of a logical table (C++ LOGT = LOGG)
 //   LOGB               - log2 bimodal entries
 //   TBITS              - tag bits
 //   CB_LMP             - 1: predict LongestMatchPred (C++ CB_LMP with CB_SC=0)
@@ -57,7 +76,6 @@
 module bp_tage_core #(
     parameter int unsigned  NHIST    = 12,
     parameter int unsigned  LOGT     = 6,
-    parameter int unsigned  LOGASSOC = 0,
     parameter int unsigned  LOGB     = 11,
     parameter int unsigned  TBITS    = 10,
     parameter int unsigned  CB_LMP   = 0,
@@ -77,52 +95,52 @@ module bp_tage_core #(
     parameter int unsigned  T13_HIST = 0,
     parameter int unsigned  T14_HIST = 0,
     parameter int unsigned  PC_W     = 64,
-    localparam int unsigned LOGG     = LOGT - LOGASSOC,
     localparam int unsigned SH_OFF   = 2 * ((NHIST / 2 + 1) / 2),
     localparam int unsigned NB       = (NHIST - SH_OFF) / 2 + SH_OFF / 2,
-    localparam int unsigned ROW_W    = 2 * (TBITS + 5)
+    localparam int unsigned DATA_W   = 2 * NB * (TBITS + 5)
 ) (
-    input  logic                       clk_i,
-    input  logic                       rst_ni,
+    input  logic                     clk_i,
+    input  logic                     rst_ni,
 
     // predict channel (CBP5 GetPrediction)
-    input  logic                       pred_req_valid_i,
-    output logic                       pred_req_ready_o,
-    input  logic [           PC_W-1:0] pred_req_pc_i,
-    output logic                       pred_resp_valid_o,
-    output logic                       pred_resp_taken_o,
+    input  logic                     pred_req_valid_i,
+    output logic                     pred_req_ready_o,
+    input  logic [         PC_W-1:0] pred_req_pc_i,
+    output logic                     pred_resp_valid_o,
+    output logic                     pred_resp_taken_o,
 
     // update channel (CBP5 UpdatePredictor / TrackOtherInst)
-    input  logic                       upd_valid_i,
-    output logic                       upd_ready_o,
-    input  logic                       upd_is_cond_i,
-    input  logic [           PC_W-1:0] upd_pc_i,
-    input  logic                       upd_taken_i,
-    input  logic [           PC_W-1:0] upd_target_i,
+    input  logic                     upd_valid_i,
+    output logic                     upd_ready_o,
+    input  logic                     upd_is_cond_i,
+    input  logic [         PC_W-1:0] upd_pc_i,
+    input  logic                     upd_taken_i,
+    input  logic [         PC_W-1:0] upd_target_i,
 
-    // tagged-table banks (1R1W, synchronous read): 2^LOGG rows x ROW_W
-    output logic [NB-1:0]              tb_re_o,
-    output logic [NB-1:0][ LOGG-1:0]   tb_raddr_o,
-    input  logic [NB-1:0][ROW_W-1:0]   tb_rdata_i,
-    output logic [NB-1:0]              tb_we_o,
-    output logic [NB-1:0][ LOGG-1:0]   tb_waddr_o,
-    output logic [NB-1:0][ROW_W-1:0]   tb_wdata_o,
+    // tagged-table banks (1R1W, synchronous read), 2^LOGT rows of 2 entries;
+    // bank b's data at [2*b*E_W +: 2*E_W]
+    output logic [NB-1:0]            tb_re_o,
+    output logic [NB-1:0][LOGT-1:0]  tb_raddr_o,
+    input  logic [       DATA_W-1:0] tb_rdata_i,
+    output logic [NB-1:0]            tb_we_o,
+    output logic [NB-1:0][LOGT-1:0]  tb_waddr_o,
+    output logic [       DATA_W-1:0] tb_wdata_o,
 
     // bimodal prediction bits: 2^LOGB x 1
-    output logic                       bp_re_o,
-    output logic [           LOGB-1:0] bp_raddr_o,
-    input  logic                       bp_rdata_i,
-    output logic                       bp_we_o,
-    output logic [           LOGB-1:0] bp_waddr_o,
-    output logic                       bp_wdata_o,
+    output logic                     bp_re_o,
+    output logic [         LOGB-1:0] bp_raddr_o,
+    input  logic                     bp_rdata_i,
+    output logic                     bp_we_o,
+    output logic [         LOGB-1:0] bp_waddr_o,
+    output logic                     bp_wdata_o,
 
     // bimodal hysteresis: 2^(LOGB-1) x 2
-    output logic                       bh_re_o,
-    output logic [           LOGB-2:0] bh_raddr_o,
-    input  logic [                1:0] bh_rdata_i,
-    output logic                       bh_we_o,
-    output logic [           LOGB-2:0] bh_waddr_o,
-    output logic [                1:0] bh_wdata_o
+    output logic                     bh_re_o,
+    output logic [         LOGB-2:0] bh_raddr_o,
+    input  logic [              1:0] bh_rdata_i,
+    output logic                     bh_we_o,
+    output logic [         LOGB-2:0] bh_waddr_o,
+    output logic [              1:0] bh_wdata_o
 );
 
     // -------------------------------------------------------------------------
@@ -158,7 +176,12 @@ module bp_tage_core #(
         f_slot = ((f_arr(t) % 2) == 0) ? 1 : 0;
     endfunction
 
-    // bank holding logical table t when the half-select bit X is x
+    // 1 = the array of table t is doubled (CB_SHARED), split by X
+    function automatic int unsigned f_dbl(input int unsigned t);
+        f_dbl = (f_arr(t) <= NHIST - SH_OFF) ? 1 : 0;
+    endfunction
+
+    // bank of table t when the half-select bit X is x
     function automatic int unsigned f_bank(input int unsigned t, input int unsigned x);
         int unsigned a, k, nd;
         a  = f_arr(t);
@@ -172,30 +195,31 @@ module bp_tage_core #(
     function automatic int unsigned f_ciw(input int unsigned t);
         int unsigned c, lg;
         c  = 25 + ((2 * ((t - 1) / 2)) % 4);
-        lg = LOGG + ((t == 1) ? 1 : 0);
+        lg = LOGT + ((t == 1) ? 1 : 0);
         if (ILEN_CAP != 0 && c > 3 * lg) c = 3 * lg;
         f_ciw = c;
     endfunction
 
-    localparam int unsigned NDPAIR = (NHIST - SH_OFF) / 2;    // doubled pairs
-    localparam int unsigned LG1    = LOGG + 1;
-    localparam int unsigned NPH    = NHIST / 2;               // odd tables
+    localparam int unsigned SH_N   = NHIST - SH_OFF;            // doubled arrays
+    localparam int unsigned NDPAIR = SH_N / 2;                  // doubled pairs
+    localparam int unsigned NPH    = NHIST / 2;                 // odd tables
     localparam int unsigned E_W    = TBITS + 5;
-    localparam int unsigned N_CNT  = (NHIST + 1) / 4 + 1;     // COUNT50 / COUNT16_31
+    localparam int unsigned N_CNT  = (NHIST + 1) / 4 + 1;       // COUNT50 / COUNT16_31
     localparam int unsigned CNT_W  = (N_CNT > 2) ? 2 : 1;
     localparam int unsigned GH_LEN = hist_len(NHIST);
+    localparam int unsigned LG1    = LOGT + 1;
+    localparam int unsigned BANK_W = (NB > 1) ? $clog2(NB) : 1;
+    localparam int unsigned NSH_D  = LOGT - 3;                  // Numero in a half row
+    localparam int unsigned NSH_S  = LOGT - 2;                  // Numero in a full row
 
     // -------------------------------------------------------------------------
     // Elaboration checks
     // -------------------------------------------------------------------------
-    if (LOGASSOC != 0) begin : g_check_assoc
-        $error("bp_tage_core: stage 1 supports LOGASSOC = 0 only");
-    end
     if (NHIST < 4 || NHIST > 14 || (NHIST % 2) != 0) begin : g_check_nhist
         $error("bp_tage_core: NHIST must be even and in 4..14");
     end
-    if (LOGG < 3 || LOGG > 14) begin : g_check_logg
-        $error("bp_tage_core: LOGT - LOGASSOC must be in 3..14");
+    if (LOGT < 3 || LOGT > 14) begin : g_check_logt
+        $error("bp_tage_core: LOGT must be in 3..14");
     end
     if (LOGB < 3 || LOGB > 24) begin : g_check_logb
         $error("bp_tage_core: LOGB must be in 3..24");
@@ -226,8 +250,8 @@ module bp_tage_core #(
         S_DEP1   = 5'd7,    // DEP, first random bit
         S_DEP2   = 5'd8,    // DEP, second random bit
         S_AHEAD  = 5'd9,    // allocation loop head (bound, SHARED filter)
-        S_AJ     = 5'd10,   // j = MYRANDOM() % ASSOC; read table i
-        S_ACHK   = 5'd11,   // allocate, or FORCEU + Penalty
+        S_AW     = 5'd10,   // read table i's bank; j = MYRANDOM() % 1
+        S_AWD    = 5'd11,   // u == 0: allocate; else FORCEU + Penalty
         S_AR1    = 5'd12,   // i -= ...
         S_AR2    = 5'd13,   // i += ...
         S_AR3    = 5'd14,   // i += ..., MaxNALLOC check
@@ -252,7 +276,7 @@ module bp_tage_core #(
     logic [       3:0]           hist_bits;
 
     // block hash results (index of odd table 2p-1 in row_q[p])
-    logic [NPH:1][LOGG-1:0]      row_q;
+    logic [NPH:1][LOGT-1:0]      row_q;
     logic                        x_q;              // SHARED half select
     logic [NHIST:1][TBITS-1:0]   tag_q;
     logic                        hash_en;
@@ -271,8 +295,14 @@ module bp_tage_core #(
     logic [3:0]                  na_q, na_d, pen_q, pen_d;
     logic                        first_q, first_d, test_q, test_d;
     logic [CNT_W-1:0]            cnt_q, cnt_d;
-    logic [LOGG:0]               sw_q, sw_d;
-    logic [NB:0]                 stale_q, stale_d;  // bit NB: bimodal
+    logic [LOGT:0]               sw_q, sw_d;
+
+    // predict -> update checkpoint (see the header) and read tracking
+    logic [2*(TBITS+5)-1:0]      ck_row_q, ck_row_d;   // provider's row
+    logic                        ck_v_q, ck_v_d;       // ... still matches the SRAM
+    logic                        ck_bp_q, ck_bp_d;     // bimodal pred bit
+    logic [1:0]                  ck_bh_q, ck_bh_d;     // bimodal hysteresis
+    logic                        rd_q, rd_req;         // op_bank read last cycle
 
     // architectural predictor state
     logic [31:0]                 seed_q, seed_d;
@@ -298,14 +328,14 @@ module bp_tage_core #(
     // -------------------------------------------------------------------------
     // Folded histories and block hash, per logical table
     // -------------------------------------------------------------------------
-    logic [NHIST:1][LOGG:0]      h_idx;            // T1: LOGG+1 bits, others LOGG
+    logic [NHIST:1][LOGT:0]      h_idx;            // T1: LOGT+1 bits, others LOGT
     logic [NHIST:1][TBITS-1:0]   h_tag;
 
     for (genvar t = 1; t <= NHIST; t++) begin : g_tbl
         localparam int unsigned L   = hist_len(t);
         localparam bit          ODD = ((t % 2) == 1);
         localparam int unsigned CIW = ODD ? f_ciw(t) : 1;
-        localparam int unsigned LGI = LOGG + ((t == 1) ? 1 : 0);
+        localparam int unsigned LGI = LOGT + ((t == 1) ? 1 : 0);
 
         logic [ CIW-1:0] ci;
         logic [    12:0] ct0;
@@ -362,7 +392,7 @@ module bp_tage_core #(
 
         bp_tage_hash #(
             .TBL   (t),
-            .LOGG  (LOGG),
+            .LOGG  (LOGT),
             .LOGG_I(LGI),
             .OLEN  (L),
             .CI_W  (CIW),
@@ -390,8 +420,8 @@ module bp_tage_core #(
             tag_q <= '0;
         end else if (hash_en) begin
             for (int unsigned p = 1; p <= NPH; p++) begin
-                if (p == 1) row_q[p] <= h_idx[1][LOGG:1];
-                else        row_q[p] <= h_idx[2 * p - 1][LOGG-1:0];
+                if (p == 1) row_q[p] <= h_idx[1][LOGT:1];
+                else        row_q[p] <= h_idx[2 * p - 1][LOGT-1:0];
             end
             x_q   <= h_idx[1][0];
             tag_q <= h_tag;
@@ -399,21 +429,34 @@ module bp_tage_core #(
     end
 
     // -------------------------------------------------------------------------
-    // Bank addresses of the current branch (Numero XORed into 2 row bits)
+    // Row of the current branch per logical table (GI ^ Numero; half row for
+    // doubled arrays), and the branch row of every bank
     // -------------------------------------------------------------------------
-    logic [NB-1:0][LOGG-1:0] baddr;
+    logic [NHIST:0][TBITS-1:0] gtag_cur;
+    logic [NHIST:0][ LOGT-1:0] row_v;
+
+    assign gtag_cur[0] = '0;
+    assign row_v[0]    = '0;
+
+    for (genvar t = 1; t <= NHIST; t++) begin : g_row
+        localparam int unsigned P   = (t + 1) / 2;    // odd table giving the index
+        localparam bit          DBL = (f_dbl(t) != 0);
+        assign gtag_cur[t] = tag_q[t] ^ TBITS'(num_q);
+        assign row_v[t]    = row_q[P] ^ (LOGT'(num_q) << (DBL ? NSH_D : NSH_S));
+    end
+
+    logic [NB-1:0][LOGT-1:0] baddr;
 
     for (genvar b = 0; b < NB; b++) begin : g_baddr
         if (b < 2 * NDPAIR) begin : g_dbl
-            // half H of doubled pair b/2+1: low tables when H == X, else partners
-            localparam int unsigned PLO = b / 2 + 1;
-            localparam int unsigned PHI = b / 2 + 1 + SH_OFF / 2;
+            // half H of doubled pair b/2+1: low tables when H == X
+            localparam int unsigned TLO = b - (b % 2) + 1;
+            localparam int unsigned THI = TLO + SH_OFF;
             localparam bit          H   = ((b % 2) == 1);
-            assign baddr[b] = ((H == x_q) ? row_q[PLO] : row_q[PHI])
-                              ^ (LOGG'(num_q) << (LOGG - 3));
+            assign baddr[b] = (H == x_q) ? row_v[TLO] : row_v[THI];
         end else begin : g_single
-            localparam int unsigned P = b - NDPAIR + 1;
-            assign baddr[b] = row_q[P] ^ (LOGG'(num_q) << (LOGG - 2));
+            localparam int unsigned T = 2 * (b - NDPAIR) + 1;
+            assign baddr[b] = row_v[T];
         end
     end
 
@@ -421,40 +464,49 @@ module bp_tage_core #(
     assign bim_idx = pcb_q[LOGB-1:0] ^ (LOGB'(num_q) << (LOGB - 2));
 
     // -------------------------------------------------------------------------
-    // Entries of the current branch, per logical table (index 0: bimodal)
+    // Read data per bank (low / high entry)
     // -------------------------------------------------------------------------
-    logic [NHIST:0][E_W-1:0]   ent;
-    logic [NHIST:0][TBITS-1:0] gtag_cur;
-    logic [NHIST:0]            hitv, dirv, weakv;
-    logic [NHIST:0][3:0]       bank0_l, bank1_l;
-    logic [NHIST:0]            slot_l;
+    logic [NB-1:0][E_W-1:0] bank_lo, bank_hi;
 
-    assign ent[0]      = '0;
-    assign gtag_cur[0] = '0;
-    assign hitv[0]     = 1'b0;
-    assign dirv[0]     = bp_rdata_i;     // no hit: the bimodal decides
-    assign weakv[0]    = 1'b0;
-    assign bank0_l[0]  = '0;
-    assign bank1_l[0]  = '0;
-    assign slot_l[0]   = 1'b0;
-
-    for (genvar t = 1; t <= NHIST; t++) begin : g_ent
-        localparam int unsigned B0 = f_bank(t, 0);
-        localparam int unsigned B1 = f_bank(t, 1);
-        localparam int unsigned SL = f_slot(t);
-
-        assign ent[t]      = x_q ? tb_rdata_i[B1][SL*E_W +: E_W] : tb_rdata_i[B0][SL*E_W +: E_W];
-        assign gtag_cur[t] = tag_q[t] ^ TBITS'(num_q);
-        assign hitv[t]     = (ent[t][E_W-1:5] == gtag_cur[t]);
-        assign dirv[t]     = ~ent[t][2];
-        assign weakv[t]    = (ent[t][2:0] == 3'b000) || (ent[t][2:0] == 3'b111);
-        assign bank0_l[t]  = 4'(B0);
-        assign bank1_l[t]  = 4'(B1);
-        assign slot_l[t]   = 1'(SL);
+    for (genvar b = 0; b < NB; b++) begin : g_bank
+        assign bank_lo[b] = tb_rdata_i[2 * b * E_W +: E_W];
+        assign bank_hi[b] = tb_rdata_i[2 * b * E_W + E_W +: E_W];
     end
 
     // -------------------------------------------------------------------------
-    // Prediction (valid in S_PRED)
+    // Entry of the current branch per logical table (table index 0: bimodal)
+    // -------------------------------------------------------------------------
+    logic [NHIST:0][E_W-1:0]    ent;
+    logic [NHIST:0]             hitv, dirv, weakv;
+    logic [NHIST:0][BANK_W-1:0] bx0_l, bx1_l;
+    logic [NHIST:0]             slot_l;
+
+    assign ent[0]    = '0;
+    assign hitv[0]   = 1'b0;
+    assign dirv[0]   = bp_rdata_i;      // no hit: the bimodal decides
+    assign weakv[0]  = 1'b0;
+    assign bx0_l[0]  = '0;
+    assign bx1_l[0]  = '0;
+    assign slot_l[0] = 1'b0;
+
+    for (genvar t = 1; t <= NHIST; t++) begin : g_ent
+        localparam int unsigned BX0 = f_bank(t, 0);
+        localparam int unsigned BX1 = f_bank(t, 1);
+        localparam int unsigned SL  = f_slot(t);
+
+        assign ent[t]    = x_q ? (SL != 0 ? bank_hi[BX1] : bank_lo[BX1])
+                               : (SL != 0 ? bank_hi[BX0] : bank_lo[BX0]);
+        assign bx0_l[t]  = BANK_W'(BX0);
+        assign bx1_l[t]  = BANK_W'(BX1);
+        assign slot_l[t] = (SL != 0);
+        assign hitv[t]   = (ent[t][E_W-1:5] == gtag_cur[t]);
+        assign dirv[t]   = ~ent[t][2];
+        assign weakv[t]  = (ent[t][2:0] == 3'b000) || (ent[t][2:0] == 3'b111);
+    end
+
+    // -------------------------------------------------------------------------
+    // Prediction (valid in S_PRED): longest match, alternate, HCpred (longest
+    // non-weak hit below a weak provider)
     // -------------------------------------------------------------------------
     logic [3:0] p_hit, p_alt, p_hc0, p_hc;
     logic       p_lmp, p_altt, p_pweak, p_hcp, p_tpred;
@@ -498,37 +550,48 @@ module bp_tage_core #(
         .seed_o   (rnd)
     );
 
-    // entry operated on in the current state
-    logic [3:0]     sel_t;
-    logic [E_W-1:0] sel_e;
-    logic [3:0]     sel_bank;
-    logic           sel_slot;
-    logic           sel_weak;
-    logic [2:0]     sel_ctr_upd;
+    // Entry operation of the current state: table sel_t at its branch row.
+    // Its row comes from the checkpoint (provider, still valid) or from the
+    // bank's read data of the previous cycle.
+    logic [3:0]        sel_t;
+    logic [BANK_W-1:0] op_bank, prov_bank;
+    logic              op_slot;
+    logic              use_ck;
+    logic [2*E_W-1:0]  op_row;
+    logic [E_W-1:0]    op_ent;
+    logic              op_weak, op_ok;
+    logic [2:0]        op_ctr_upd;
 
     always_comb begin
         case (state_q)
-            S_AJ, S_ACHK: sel_t = i_q[3:0];
-            S_F_ALT:      sel_t = alt_q;
-            S_F_HC:       sel_t = hc_q;
-            default:      sel_t = hit_q;
+            S_AW, S_AWD: sel_t = i_q[3:0];
+            S_F_ALT:     sel_t = alt_q;
+            S_F_HC:      sel_t = hc_q;
+            default:     sel_t = hit_q;
         endcase
+        op_bank   = x_q ? bx1_l[sel_t] : bx0_l[sel_t];
+        prov_bank = x_q ? bx1_l[hit_q] : bx0_l[hit_q];
+        op_slot   = slot_l[sel_t];
+        use_ck    = (state_q == S_F_PROV) && ck_v_q;
+        op_row    = use_ck ? ck_row_q : {bank_hi[op_bank], bank_lo[op_bank]};
+        op_ent    = op_slot ? op_row[E_W +: E_W] : op_row[0 +: E_W];
+        op_weak   = (op_ent[2:0] == 3'b000) || (op_ent[2:0] == 3'b111);
+        op_ok     = use_ck || rd_q;       // the row data is valid this cycle
     end
 
-    assign sel_e    = ent[sel_t];
-    assign sel_bank = x_q ? bank1_l[sel_t] : bank0_l[sel_t];
-    assign sel_slot = slot_l[sel_t];
-    assign sel_weak = weakv[sel_t];
-
     bp_sat_ctr #(.WIDTH(3), .SIGNED(1'b1)) i_ent_ctr (
-        .ctr_i(sel_e[2:0]),
+        .ctr_i(op_ent[2:0]),
         .inc_i(dir_q),
-        .ctr_o(sel_ctr_upd)
+        .ctr_o(op_ctr_upd)
     );
 
     // bimodal counter: BIM = pred ? hyst : -1 - hyst (3-bit)
     logic [2:0] bim_val, bim_upd;
-    assign bim_val = bp_rdata_i ? {1'b0, bh_rdata_i} : {1'b1, ~bh_rdata_i};
+    logic       bim_pred_new;
+    logic [1:0] bim_hyst_new;
+    assign bim_val      = ck_bp_q ? {1'b0, ck_bh_q} : {1'b1, ~ck_bh_q};
+    assign bim_pred_new = ~bim_upd[2];
+    assign bim_hyst_new = bim_upd[2] ? ~bim_upd[1:0] : bim_upd[1:0];
 
     bp_sat_ctr #(.WIDTH(3), .SIGNED(1'b1)) i_bim_ctr (
         .ctr_i(bim_val),
@@ -571,10 +634,10 @@ module bp_tage_core #(
     // right and the alternate wrong; -1 when wrong and tage_pred right
     logic [1:0] u_new;
     always_comb begin
-        u_new = sel_e[4:3];
+        u_new = op_ent[4:3];
         if (lmp_q != altt_q) begin
-            if (lmp_q == dir_q)                          u_new = sel_e[4] ? 2'b11 : 2'b10;
-            else if (sel_e[4:3] != 2'b00 && tpred_q == dir_q) u_new = sel_e[4:3] - 2'b01;
+            if (lmp_q == dir_q)                                 u_new = op_ent[4] ? 2'b11 : 2'b10;
+            else if (op_ent[4:3] != 2'b00 && tpred_q == dir_q)  u_new = op_ent[4:3] - 2'b01;
         end
     end
 
@@ -600,14 +663,19 @@ module bp_tage_core #(
     // Control
     // -------------------------------------------------------------------------
     logic           lat_upd;     // latch the update inputs
-    logic [NB:0]    rd_req;      // re-read requests (bit NB: bimodal)
-    logic           wr_en;       // write entry wr_e of table sel_t
+    logic           wr_en;       // entry wr_e for table sel_t ...
+    logic           wr_do;       // ... and it differs from the stored one
     logic [E_W-1:0] wr_e;
     logic           bim_wr;
+    logic           bp_do, bh_do;
     logic           sweep_rd, sweep_wr;
     logic           blk_end;
+    logic [BANK_W-1:0] ck_bank;  // provider bank of the prediction (S_PRED)
 
     assign blk_end = (num_q == 2'd3) || dir_q;
+    assign bp_do   = bim_wr && (bim_pred_new != ck_bp_q);
+    assign bh_do   = bim_wr && (bim_hyst_new != ck_bh_q);
+    assign ck_bank = x_q ? bx1_l[p_hit] : bx0_l[p_hit];
 
     always_comb begin
         state_d  = state_q;
@@ -628,7 +696,10 @@ module bp_tage_core #(
         test_d   = test_q;
         cnt_d    = cnt_q;
         sw_d     = sw_q;
-        stale_d  = stale_q;
+        ck_row_d = ck_row_q;
+        ck_v_d   = ck_v_q;
+        ck_bp_d  = ck_bp_q;
+        ck_bh_d  = ck_bh_q;
         tick_d   = tick_q;
         cm11_d   = cm11_q;
         clc_d    = clc_q;
@@ -637,283 +708,261 @@ module bp_tage_core #(
         c1631_d  = c1631_q;
         rng_en   = 1'b0;
         lat_upd  = 1'b0;
-        rd_req   = '0;
+        rd_req   = 1'b0;
         wr_en    = 1'b0;
-        wr_e     = sel_e;
+        wr_e     = op_ent;
         bim_wr   = 1'b0;
         sweep_rd = 1'b0;
         sweep_wr = 1'b0;
         hash_en  = 1'b0;
 
-        case (state_q)
-            S_IDLE: begin
-                if (pred_fire) begin
-                    state_d = S_PRED;
-                end else if (unc_fire) begin
-                    lat_upd = 1'b1;
-                    state_d = S_HIST;
+        // a final-update entry operation without valid row data reads its
+        // bank this cycle and repeats the state (data valid next cycle)
+        if (!op_ok && (state_q == S_F_ALT || (state_q == S_F_HC && hc_q != '0)
+                       || (state_q == S_F_PROV && hit_q != '0))) begin
+            rd_req = 1'b1;
+        end else begin
+            case (state_q)
+                S_IDLE: begin
+                    if (pred_fire) begin
+                        state_d = S_PRED;
+                    end else if (unc_fire) begin
+                        lat_upd = 1'b1;
+                        state_d = S_HIST;
+                    end
                 end
-            end
 
-            S_PRED: begin
-                hit_d   = p_hit;
-                alt_d   = p_alt;
-                hc_d    = p_hc;
-                lmp_d   = p_lmp;
-                hcp_d   = p_hcp;
-                altt_d  = p_altt;
-                tpred_d = p_tpred;
-                pweak_d = p_pweak;
-                state_d = S_WAIT;
-            end
-
-            S_WAIT: begin
-                if (upd_cond_fire) begin
-                    lat_upd = 1'b1;
-                    stale_d = '1;              // re-read every table at update
-                    state_d = S_CLC;
+                S_PRED: begin
+                    hit_d   = p_hit;
+                    alt_d   = p_alt;
+                    hc_d    = p_hc;
+                    lmp_d   = p_lmp;
+                    hcp_d   = p_hcp;
+                    altt_d  = p_altt;
+                    tpred_d = p_tpred;
+                    pweak_d = p_pweak;
+                    // checkpoint: the provider's row and the bimodal entry
+                    ck_row_d = {bank_hi[ck_bank], bank_lo[ck_bank]};
+                    ck_v_d   = 1'b1;
+                    ck_bp_d  = bp_rdata_i;
+                    ck_bh_d  = bh_rdata_i;
+                    state_d  = S_WAIT;
                 end
-            end
 
-            S_CLC: begin
-                if (hit_q != '0) begin
-                    if (pweak_q) begin
-                        clc_d = clc_sat;
+                S_WAIT: begin
+                    if (upd_cond_fire) begin
+                        lat_upd = 1'b1;
+                        state_d = S_CLC;
+                    end
+                end
+
+                S_CLC: begin
+                    if (hit_q != '0) begin
+                        if (pweak_q) begin
+                            clc_d = clc_sat;
+                        end else begin
+                            rng_en = 1'b1;
+                            if (rnd[1:0] == 2'b00) clc_d = clc_sat;
+                        end
+                        if (pweak_q && (lmp_q != hcp_q)) uaon_d = uaon_sat;
+                    end
+                    alloc_d = (hit_q < 4'(NHIST)) && (lmp_q != dir_q) && (tpred_q != dir_q);
+                    state_d = S_CM11;
+                end
+
+                S_CM11: begin
+                    if (tpred_q != dir_q) begin
+                        cm11_d = cm11_sat;
                     end else begin
                         rng_en = 1'b1;
-                        if (rnd[1:0] == 2'b00) clc_d = clc_sat;
+                        if (rnd[4:0] < 5'd4) cm11_d = cm11_sat;
                     end
-                    if (pweak_q && (lmp_q != hcp_q)) uaon_d = uaon_sat;
+                    if ((hit_q != '0) && pweak_q) begin
+                        cnt_d   = CNT_W'(hit_q >> 2);
+                        state_d = S_CNT;
+                    end else begin
+                        state_d = S_FILT;
+                    end
                 end
-                alloc_d = (hit_q < 4'(NHIST)) && (lmp_q != dir_q) && (tpred_q != dir_q);
-                state_d = S_CM11;
-            end
 
-            S_CM11: begin
-                if (tpred_q != dir_q) begin
-                    cm11_d = cm11_sat;
-                end else begin
-                    rng_en = 1'b1;
-                    if (rnd[4:0] < 5'd4) cm11_d = cm11_sat;
+                S_CNT: begin
+                    c50_d[cnt_q] = c50_sat;
+                    if (lmp_q != dir_q) begin
+                        c1631_d[cnt_q] = c1631_sat;
+                    end else begin
+                        rng_en = 1'b1;
+                        if (rnd[4:0] > 5'd1) c1631_d[cnt_q] = c1631_sat;
+                    end
+                    if (cnt_q == CNT_W'(NHIST / 4)) state_d = S_FILT;
+                    else                            cnt_d   = cnt_q + CNT_W'(1);
                 end
-                if ((hit_q != '0) && pweak_q) begin
-                    cnt_d   = CNT_W'(hit_q >> 2);
-                    state_d = S_CNT;
-                end else begin
-                    state_d = S_FILT;
-                end
-            end
 
-            S_CNT: begin
-                c50_d[cnt_q] = c50_sat;
-                if (lmp_q != dir_q) begin
-                    c1631_d[cnt_q] = c1631_sat;
-                end else begin
-                    rng_en = 1'b1;
-                    if (rnd[4:0] > 5'd1) c1631_d[cnt_q] = c1631_sat;
-                end
-                if (cnt_q == CNT_W'(NHIST / 4)) state_d = S_FILT;
-                else                            cnt_d   = cnt_q + CNT_W'(1);
-            end
-
-            S_FILT: begin
-                // the right-hand side of ALLOC &= ... is evaluated (and
-                // MYRANDOM called) even when ALLOC is already false
-                if (c50_q[kf][6]) begin
-                    rng_en  = 1'b1;
-                    alloc_d = alloc_q && (rnd[2:0] == 3'd0);
-                end else if (c1631_q[kf][6]) begin
-                    rng_en  = 1'b1;
-                    alloc_d = alloc_q && !rnd[0];
-                end
-                state_d = alloc_d ? S_DEP1 : ff_state;
-            end
-
-            S_DEP1: begin
-                rng_en  = 1'b1;
-                i_d     = 5'(hit_q) + 5'd1 + 5'(!rnd[0]);
-                maxna_d = 5'(cm11_q[7]) + (clc_q[6] ? 5'd0 : 5'd8);
-                na_d    = '0;
-                pen_d   = '0;
-                first_d = 1'b1;
-                test_d  = 1'b0;
-                state_d = S_DEP2;
-            end
-
-            S_DEP2: begin
-                rng_en  = 1'b1;
-                i_d     = i_q + 5'(rnd[1:0] == 2'b00);
-                state_d = S_AHEAD;
-            end
-
-            S_AHEAD: begin
-                if (i_q > 5'(NHIST)) begin
-                    state_d = S_TICK;
-                end else if ((i_q > 5'(SH_OFF)) && !test_q) begin
-                    // long tables (sharing storage with short ones) when the
-                    // misprediction rate is high
-                    test_d = 1'b1;
-                    if (!cm11_q[7]) begin
+                S_FILT: begin
+                    // the right-hand side of ALLOC &= ... is evaluated (and
+                    // MYRANDOM called) even when ALLOC is already false
+                    if (c50_q[kf][6]) begin
                         rng_en  = 1'b1;
-                        state_d = (rnd[2:0] != 3'd0) ? S_TICK : S_AJ;
-                    end else begin
-                        state_d = S_AJ;
+                        alloc_d = alloc_q && (rnd[2:0] == 3'd0);
+                    end else if (c1631_q[kf][6]) begin
+                        rng_en  = 1'b1;
+                        alloc_d = alloc_q && !rnd[0];
                     end
-                end else begin
-                    state_d = S_AJ;
+                    state_d = alloc_d ? S_DEP1 : ff_state;
                 end
-            end
 
-            S_AJ: begin
-                rng_en = 1'b1;                 // j = MYRANDOM() % ASSOC
-                if (stale_q[sel_bank]) begin
-                    rd_req[sel_bank]  = 1'b1;
-                    stale_d[sel_bank] = 1'b0;
+                S_DEP1: begin
+                    rng_en  = 1'b1;
+                    i_d     = 5'(hit_q) + 5'd1 + 5'(!rnd[0]);
+                    maxna_d = 5'(cm11_q[7]) + (clc_q[6] ? 5'd0 : 5'd8);
+                    na_d    = '0;
+                    pen_d   = '0;
+                    first_d = 1'b1;
+                    test_d  = 1'b0;
+                    state_d = S_DEP2;
                 end
-                state_d = S_ACHK;
-            end
 
-            S_ACHK: begin
-                if (sel_e[4:3] == 2'b00) begin
-                    // allocate: tag, u = First (FORCEU), weak counter
-                    wr_en             = 1'b1;
-                    wr_e              = {gtag_cur[sel_t], 1'b0, first_q, dir_q ? 3'b000 : 3'b111};
-                    stale_d[sel_bank] = 1'b1;
-                    na_d              = na_q + 4'd1;
-                    if ((i_q >= 5'd3) || !first_q) maxna_d = maxna_q - 5'd1;
-                    first_d           = 1'b0;
-                    i_d               = i_q + 5'd2;
-                    state_d           = S_AR1;
-                end else begin
-                    // FORCEU: maybe clear u of a weak entry with u == 1
+                S_DEP2: begin
+                    rng_en  = 1'b1;
+                    i_d     = i_q + 5'(rnd[1:0] == 2'b00);
+                    state_d = S_AHEAD;
+                end
+
+                S_AHEAD: begin
+                    if (i_q > 5'(NHIST)) begin
+                        state_d = S_TICK;
+                    end else if ((i_q > 5'(SH_OFF)) && !test_q) begin
+                        // long tables (sharing storage with short ones) when the
+                        // misprediction rate is high
+                        test_d = 1'b1;
+                        if (!cm11_q[7]) begin
+                            rng_en  = 1'b1;
+                            state_d = (rnd[2:0] != 3'd0) ? S_TICK : S_AW;
+                        end else begin
+                            state_d = S_AW;
+                        end
+                    end else begin
+                        state_d = S_AW;
+                    end
+                end
+
+                S_AW: begin
+                    // read table i's row; j = MYRANDOM() % ASSOC (ASSOC = 1: j = 0)
+                    rd_req  = 1'b1;
+                    rng_en  = 1'b1;
+                    state_d = S_AWD;
+                end
+
+                S_AWD: begin
+                    if (op_ent[4:3] == 2'b00) begin
+                        // new entry: tag, u = First (FORCEU), weak counter
+                        wr_en   = 1'b1;
+                        wr_e    = {gtag_cur[sel_t], 1'b0, first_q, dir_q ? 3'b000 : 3'b111};
+                        na_d    = na_q + 4'd1;
+                        if ((i_q >= 5'd3) || !first_q) maxna_d = maxna_q - 5'd1;
+                        first_d = 1'b0;
+                        i_d     = i_q + 5'd2;
+                        state_d = S_AR1;
+                    end else begin
+                        // FORCEU: maybe clear u of a weak entry with u == 1
+                        rng_en = 1'b1;
+                        if (!rnd[0] && op_weak && (op_ent[4:3] == 2'b01)) begin
+                            wr_en = 1'b1;
+                            wr_e  = {op_ent[E_W-1:5], 2'b00, op_ent[2:0]};
+                        end
+                        pen_d   = pen_q + 4'd1;
+                        i_d     = i_q + 5'd1;
+                        state_d = S_AHEAD;
+                    end
+                end
+
+                S_AR1: begin
+                    rng_en  = 1'b1;
+                    i_d     = i_q - 5'(!rnd[0]);
+                    state_d = S_AR2;
+                end
+
+                S_AR2: begin
+                    rng_en  = 1'b1;
+                    i_d     = i_q + 5'(!rnd[0]);
+                    state_d = S_AR3;
+                end
+
+                S_AR3: begin
                     rng_en = 1'b1;
-                    if (!rnd[0] && sel_weak && (sel_e[4:3] == 2'b01)) begin
-                        wr_en             = 1'b1;
-                        wr_e              = {sel_e[E_W-1:5], 2'b00, sel_e[2:0]};
-                        stale_d[sel_bank] = 1'b1;
-                    end
-                    pen_d   = pen_q + 4'd1;
-                    i_d     = i_q + 5'd1;
-                    state_d = S_AHEAD;
-                end
-            end
-
-            S_AR1: begin
-                rng_en  = 1'b1;
-                i_d     = i_q - 5'(!rnd[0]);
-                state_d = S_AR2;
-            end
-
-            S_AR2: begin
-                rng_en  = 1'b1;
-                i_d     = i_q + 5'(!rnd[0]);
-                state_d = S_AR3;
-            end
-
-            S_AR3: begin
-                rng_en = 1'b1;
-                if (maxna_q[4]) begin          // MaxNALLOC < 0
-                    state_d = S_TICK;
-                end else begin
-                    i_d     = i_q + 5'(rnd[1:0] == 2'b00) + 5'd1;
-                    state_d = S_AHEAD;
-                end
-            end
-
-            S_TICK: begin
-                if (tick_sum[13]) begin            // < 0: clamp
-                    tick_d  = '0;
-                    state_d = ff_state;
-                end else if (tick_sum[12]) begin   // >= BORNTICK: reset u
-                    tick_d  = '0;
-                    sw_d    = '0;
-                    state_d = S_SWEEP;
-                end else begin
-                    tick_d  = tick_sum[11:0];
-                    state_d = ff_state;
-                end
-            end
-
-            S_SWEEP: begin
-                // read row sw while writing back row sw - 1
-                sweep_rd = !sw_q[LOGG];
-                sweep_wr = (sw_q != '0);
-                sw_d     = sw_q + LG1'(1);
-                if (sw_q[LOGG]) begin
-                    stale_d[NB-1:0] = '1;
-                    state_d         = ff_state;
-                end
-            end
-
-            S_F_ALT: begin
-                if (stale_q[sel_bank]) begin
-                    rd_req[sel_bank]  = 1'b1;
-                    stale_d[sel_bank] = 1'b0;
-                end else begin
-                    wr_en             = 1'b1;
-                    wr_e              = {sel_e[E_W-1:3], sel_ctr_upd};
-                    stale_d[sel_bank] = 1'b1;
-                    state_d           = S_F_HC;
-                end
-            end
-
-            S_F_HC: begin
-                if (hc_q != '0) begin
-                    if (stale_q[sel_bank]) begin
-                        rd_req[sel_bank]  = 1'b1;
-                        stale_d[sel_bank] = 1'b0;
+                    if (maxna_q[4]) begin          // MaxNALLOC < 0
+                        state_d = S_TICK;
                     end else begin
-                        wr_en             = 1'b1;
-                        wr_e              = {sel_e[E_W-1:3], sel_ctr_upd};
-                        stale_d[sel_bank] = 1'b1;
-                        state_d           = S_F_PROV;
-                    end
-                end else begin
-                    if (stale_q[NB]) begin
-                        rd_req[NB]  = 1'b1;
-                        stale_d[NB] = 1'b0;
-                    end else begin
-                        bim_wr      = 1'b1;
-                        stale_d[NB] = 1'b1;
-                        state_d     = S_F_PROV;
+                        i_d     = i_q + 5'(rnd[1:0] == 2'b00) + 5'd1;
+                        state_d = S_AHEAD;
                     end
                 end
-            end
 
-            S_F_PROV: begin
-                if (hit_q != '0) begin
-                    if (stale_q[sel_bank]) begin
-                        rd_req[sel_bank]  = 1'b1;
-                        stale_d[sel_bank] = 1'b0;
+                S_TICK: begin
+                    if (tick_sum[13]) begin            // < 0: clamp
+                        tick_d  = '0;
+                        state_d = ff_state;
+                    end else if (tick_sum[12]) begin   // >= BORNTICK: reset u
+                        tick_d  = '0;
+                        sw_d    = '0;
+                        ck_v_d  = 1'b0;                // the sweep rewrites rows
+                        state_d = S_SWEEP;
                     end else begin
-                        wr_en             = 1'b1;
-                        wr_e              = {sel_e[E_W-1:5], u_new, sel_ctr_upd};
-                        stale_d[sel_bank] = 1'b1;
-                        state_d           = S_HIST;
-                    end
-                end else begin
-                    if (stale_q[NB]) begin
-                        rd_req[NB]  = 1'b1;
-                        stale_d[NB] = 1'b0;
-                    end else begin
-                        bim_wr      = 1'b1;
-                        stale_d[NB] = 1'b1;
-                        state_d     = S_HIST;
+                        tick_d  = tick_sum[11:0];
+                        state_d = ff_state;
                     end
                 end
-            end
 
-            S_HIST: begin
-                state_d = blk_end ? S_HASH : S_IDLE;
-            end
+                S_SWEEP: begin
+                    // read row sw while writing back row sw - 1
+                    sweep_rd = !sw_q[LOGT];
+                    sweep_wr = (sw_q != '0);
+                    sw_d     = sw_q + LG1'(1);
+                    if (sw_q[LOGT]) state_d = ff_state;
+                end
 
-            S_HASH: begin
-                hash_en = 1'b1;
-                state_d = S_IDLE;
-            end
+                S_F_ALT: begin
+                    wr_en   = 1'b1;
+                    wr_e    = {op_ent[E_W-1:3], op_ctr_upd};
+                    state_d = S_F_HC;
+                end
 
-            default: state_d = S_IDLE;
-        endcase
+                S_F_HC: begin
+                    if (hc_q != '0) begin
+                        wr_en = 1'b1;
+                        wr_e  = {op_ent[E_W-1:3], op_ctr_upd};
+                    end else begin
+                        bim_wr = 1'b1;
+                    end
+                    state_d = S_F_PROV;
+                end
+
+                S_F_PROV: begin
+                    if (hit_q != '0) begin
+                        wr_en = 1'b1;
+                        wr_e  = {op_ent[E_W-1:5], u_new, op_ctr_upd};
+                    end else begin
+                        bim_wr = 1'b1;
+                    end
+                    state_d = S_HIST;
+                end
+
+                S_HIST: begin
+                    state_d = blk_end ? S_HASH : S_IDLE;
+                end
+
+                S_HASH: begin
+                    hash_en = 1'b1;
+                    state_d = S_IDLE;
+                end
+
+                default: state_d = S_IDLE;
+            endcase
+        end
+
+        // a write is skipped when it would store the value the row holds; a
+        // write to the provider's bank makes the checkpoint stale
+        wr_do = wr_en && (wr_e != op_ent);
+        if (wr_do && (op_bank == prov_bank)) ck_v_d = 1'b0;
     end
 
     // -------------------------------------------------------------------------
@@ -955,38 +1004,46 @@ module bp_tage_core #(
     end
 
     // -------------------------------------------------------------------------
-    // SRAM ports
+    // SRAM ports (every bank is read and written at its branch row baddr,
+    // the sweep at row sw / sw - 1)
     // -------------------------------------------------------------------------
-    logic [LOGG-1:0] sw_m1;
-    assign sw_m1 = LOGG'(sw_q - LG1'(1));
+    logic [LOGT-1:0] sw_m1;
+    assign sw_m1 = LOGT'(sw_q - LG1'(1));
 
     for (genvar b = 0; b < NB; b++) begin : g_port
-        logic [E_W-1:0] lo, hi, lo_dec, hi_dec;
-        assign lo     = tb_rdata_i[b][E_W-1:0];
-        assign hi     = tb_rdata_i[b][ROW_W-1:E_W];
-        // u - 1 when u > 0 (global u reset), ctr and tag unchanged
-        assign lo_dec = {lo[E_W-1:5], (lo[4:3] != 2'b00) ? (lo[4:3] - 2'b01) : 2'b00, lo[2:0]};
-        assign hi_dec = {hi[E_W-1:5], (hi[4:3] != 2'b00) ? (hi[4:3] - 2'b01) : 2'b00, hi[2:0]};
+        logic           sel;      // the entry operation targets this bank
+        logic           sw_chg;   // sweep: an entry of the row has u > 0
+        logic [E_W-1:0] lo_dec, hi_dec;
 
-        assign tb_re_o[b]    = pred_fire || sweep_rd || rd_req[b];
-        assign tb_raddr_o[b] = sweep_rd ? sw_q[LOGG-1:0] : baddr[b];
-        assign tb_we_o[b]    = sweep_wr || (wr_en && (sel_bank == 4'(b)));
+        assign sel    = (op_bank == BANK_W'(b));
+        assign sw_chg = (bank_lo[b][4:3] != 2'b00) || (bank_hi[b][4:3] != 2'b00);
+        // u - 1 when u > 0 (global u reset), ctr and tag unchanged
+        assign lo_dec = {bank_lo[b][E_W-1:5],
+                         (bank_lo[b][4:3] != 2'b00) ? (bank_lo[b][4:3] - 2'b01) : 2'b00,
+                         bank_lo[b][2:0]};
+        assign hi_dec = {bank_hi[b][E_W-1:5],
+                         (bank_hi[b][4:3] != 2'b00) ? (bank_hi[b][4:3] - 2'b01) : 2'b00,
+                         bank_hi[b][2:0]};
+
+        assign tb_re_o[b]    = pred_fire || sweep_rd || (rd_req && sel);
+        assign tb_raddr_o[b] = sweep_rd ? sw_q[LOGT-1:0] : baddr[b];
+        assign tb_we_o[b]    = (sweep_wr && sw_chg) || (wr_do && sel);
         assign tb_waddr_o[b] = sweep_wr ? sw_m1 : baddr[b];
-        // sweep: decrement u in both entries; else replace one entry
-        assign tb_wdata_o[b] = sweep_wr ? {hi_dec, lo_dec}
-                             : (sel_slot ? {wr_e, lo} : {hi, wr_e});
+        assign tb_wdata_o[2 * b * E_W +: 2 * E_W] =
+            sweep_wr ? {hi_dec, lo_dec}
+                     : (op_slot ? {wr_e, op_row[0 +: E_W]} : {op_row[E_W +: E_W], wr_e});
     end
 
-    assign bp_re_o    = pred_fire || rd_req[NB];
+    assign bp_re_o    = pred_fire;
     assign bp_raddr_o = bim_idx;
-    assign bp_we_o    = bim_wr;
+    assign bp_we_o    = bp_do;
     assign bp_waddr_o = bim_idx;
-    assign bp_wdata_o = ~bim_upd[2];
-    assign bh_re_o    = pred_fire || rd_req[NB];
+    assign bp_wdata_o = bim_pred_new;
+    assign bh_re_o    = pred_fire;
     assign bh_raddr_o = bim_idx[LOGB-1:1];
-    assign bh_we_o    = bim_wr;
+    assign bh_we_o    = bh_do;
     assign bh_waddr_o = bim_idx[LOGB-1:1];
-    assign bh_wdata_o = bim_upd[2] ? ~bim_upd[1:0] : bim_upd[1:0];
+    assign bh_wdata_o = bim_hyst_new;
 
     // -------------------------------------------------------------------------
     // Registers
@@ -1005,6 +1062,8 @@ module bp_tage_core #(
             pcb_q   <= '0;
             num_q   <= '0;
             seed_q  <= '0;
+            rd_q    <= 1'b0;
+            ck_v_q  <= 1'b0;
             tick_q  <= '0;
             cm11_q  <= 8'hc0;          // -64
             clc_q   <= '0;
@@ -1019,6 +1078,8 @@ module bp_tage_core #(
             pcb_q   <= pcb_d;
             num_q   <= num_d;
             seed_q  <= seed_d;
+            rd_q    <= rd_req;
+            ck_v_q  <= ck_v_d;
             tick_q  <= tick_d;
             cm11_q  <= cm11_d;
             clc_q   <= clc_d;
@@ -1047,7 +1108,9 @@ module bp_tage_core #(
         test_q  <= test_d;
         cnt_q   <= cnt_d;
         sw_q    <= sw_d;
-        stale_q <= stale_d;
+        ck_row_q <= ck_row_d;
+        ck_bp_q <= ck_bp_d;
+        ck_bh_q <= ck_bh_d;
         if (lat_upd) begin
             dir_q <= upd_taken_i;
             pc_q  <= upd_pc_i[35:0];
@@ -1061,7 +1124,7 @@ module bp_tage_core #(
     /* verilator lint_off UNUSEDSIGNAL */
     logic unused_ok;
     assign unused_ok = ^{pred_req_pc_i, upd_pc_i[PC_W-1:36], upd_target_i[PC_W-1:36],
-                         pcx[31], hit_p1[4], hit_p1[1:0], h_idx, bank0_l, bank1_l};
+                         pcx[31], hit_p1[4], hit_p1[1:0], h_idx};
     /* verilator lint_on UNUSEDSIGNAL */
 
     // -------------------------------------------------------------------------
@@ -1084,6 +1147,9 @@ module bp_tage_core #(
         end
         if (rst_ni && pred_req_valid_i && !pred_req_ready_o)
             $error("bp_tage_core: predict request while a branch is in flight");
+        // a write needs this cycle's row data (checkpoint or last cycle's read)
+        if (rst_ni && wr_en && !op_ok)
+            $error("bp_tage_core: entry write without valid row data");
     end
 `endif
 

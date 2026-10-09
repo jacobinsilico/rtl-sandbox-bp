@@ -3,16 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Description:
-//   Integration of bp_tage_core with its tables as behavioral bp_sram models:
-//   NB tagged banks (2^LOGG rows x 2 entries), the bimodal prediction bits
-//   (2^LOGB x 1, reset 0) and the bimodal hysteresis (2^(LOGB-1) x 2,
-//   reset 1), the C++ constructor's initial values. INTEGRATION ONLY: never
-//   synthesize this module (bp_sram would become flip-flops). Synthesize
-//   bp_tage_core and cost the SRAMs separately from the testbench access
-//   counts. Same predict / update interface as the core.
+//   Integration of bp_tage_core (direct-mapped) with its tables as behavioral
+//   bp_sram models: NB tagged banks (2^LOGT rows of 2 entries), the bimodal
+//   prediction bits (2^LOGB x 1, reset 0) and the bimodal hysteresis
+//   (2^(LOGB-1) x 2, reset 1), the C++ constructor's initial values.
+//   INTEGRATION ONLY: never synthesize this module (bp_sram would become
+//   flip-flops). Synthesize bp_tage_core and cost the SRAMs separately from
+//   the testbench access counts. Same predict / update interface as the core.
 //
 // Parameters:
-//   see bp_tage_core (NHIST, LOGT, LOGASSOC, LOGB, TBITS, CB_LMP, ILEN_CAP,
+//   see bp_tage_core (NHIST, LOGT, LOGB, TBITS, CB_LMP, ILEN_CAP,
 //   T1_HIST..T14_HIST, PC_W)
 // -----------------------------------------------------------------------------
 
@@ -21,7 +21,6 @@
 module bp_tage_top #(
     parameter int unsigned NHIST    = 12,
     parameter int unsigned LOGT     = 6,
-    parameter int unsigned LOGASSOC = 0,
     parameter int unsigned LOGB     = 11,
     parameter int unsigned TBITS    = 10,
     parameter int unsigned CB_LMP   = 0,
@@ -59,14 +58,14 @@ module bp_tage_top #(
     input  logic [PC_W-1:0] upd_target_i
 );
 
-    localparam int unsigned LOGG   = LOGT - LOGASSOC;
     localparam int unsigned SH_OFF = 2 * ((NHIST / 2 + 1) / 2);
     localparam int unsigned NB     = (NHIST - SH_OFF) / 2 + SH_OFF / 2;
     localparam int unsigned ROW_W  = 2 * (TBITS + 5);
+    localparam int unsigned DATA_W = NB * ROW_W;
 
     logic [NB-1:0]            tb_re, tb_we;
-    logic [NB-1:0][ LOGG-1:0] tb_raddr, tb_waddr;
-    logic [NB-1:0][ROW_W-1:0] tb_rdata, tb_wdata;
+    logic [NB-1:0][ LOGT-1:0] tb_raddr, tb_waddr;
+    logic [     DATA_W-1:0]   tb_rdata, tb_wdata;
     logic                     bp_re, bp_we, bp_rdata, bp_wdata;
     logic [      LOGB-1:0]    bp_raddr, bp_waddr;
     logic                     bh_re, bh_we;
@@ -76,7 +75,6 @@ module bp_tage_top #(
     bp_tage_core #(
         .NHIST   (NHIST),
         .LOGT    (LOGT),
-        .LOGASSOC(LOGASSOC),
         .LOGB    (LOGB),
         .TBITS   (TBITS),
         .CB_LMP  (CB_LMP),
@@ -132,16 +130,16 @@ module bp_tage_top #(
 
     for (genvar b = 0; b < NB; b++) begin : g_tb
         bp_sram #(
-            .DEPTH(1 << LOGG),
+            .DEPTH(1 << LOGT),
             .WIDTH(ROW_W)
         ) i_tb (
             .clk_i  (clk_i),
             .re_i   (tb_re[b]),
             .raddr_i(tb_raddr[b]),
-            .rdata_o(tb_rdata[b]),
+            .rdata_o(tb_rdata[b * ROW_W +: ROW_W]),
             .we_i   (tb_we[b]),
             .waddr_i(tb_waddr[b]),
-            .wdata_i(tb_wdata[b])
+            .wdata_i(tb_wdata[b * ROW_W +: ROW_W])
         );
     end
 
