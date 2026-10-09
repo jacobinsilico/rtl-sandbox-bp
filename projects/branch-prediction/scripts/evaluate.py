@@ -34,8 +34,7 @@
 #     gshare, g_perceptron  the .json (-D defines)
 #     hashed_perceptron     the .log (PREDICTOR_CONFIG, PREDICTOR_HIST_LENS)
 #     tage_cb               the .log (PREDICTOR_CONFIG, PREDICTOR_KNOBS,
-#                           PREDICTOR_HIST_LENS); 2-way configs are skipped
-#                           until the 2-way RTL exists
+#                           PREDICTOR_HIST_LENS); direct-mapped and 2-way
 #
 # Output:
 #   projects/<project>/eval/<predictor>/<budget>/<step>.{log,json}
@@ -198,17 +197,19 @@ def params_tage_cb(stem):
     for key, want in (("CB_SC", 0), ("AHEAD", 0), ("CB_OPTTAGE", 1)):
         if need(kv, key) != want:
             raise ValueError(f"RTL needs {key}={want}, the dump has {kv[key]}")
-    if need(kv, "LOGASSOC") != 0:
-        raise ValueError("LOGASSOC=1 (2-way PSK/REPSK) is not in the RTL yet")
+    assoc = need(kv, "LOGASSOC")
+    if assoc not in (0, 1):
+        raise ValueError(f"LOGASSOC {assoc} not supported (0 or 1)")
     knobs = log_pairs(stem, "PREDICTOR_KNOBS") or {}
-    bad = [f"{k}={knobs[k]}" for k, v in TAGE_FIXED.items() if k in knobs and int(knobs[k]) != v]
+    fixed = dict(TAGE_FIXED, **({"CB_PSK": 1, "CB_REPSK": 1} if assoc else {}))
+    bad = [f"{k}={knobs[k]}" for k, v in fixed.items() if k in knobs and int(knobs[k]) != v]
     if bad:
-        raise ValueError(f"RTL hard-codes {TAGE_FIXED}; the dump has {' '.join(bad)}")
+        raise ValueError(f"RTL hard-codes {fixed}; the dump has {' '.join(bad)}")
     n = need(kv, "NHIST")
     hist = hist_lens(stem)
     if len(hist) != n or n > 14:
         raise ValueError(f"need NHIST <= 14 and one history length per table (NHIST {n})")
-    p = {"NHIST": n, "LOGT": need(kv, "LOGT"), "LOGASSOC": 0, "LOGB": need(kv, "LOGB"),
+    p = {"NHIST": n, "LOGT": need(kv, "LOGT"), "LOGASSOC": assoc, "LOGB": need(kv, "LOGB"),
          "TBITS": need(kv, "TBITS"), "CB_LMP": need(kv, "CB_LMP"),
          "ILEN_CAP": need(kv, "CB_ILEN_CAP")}
     p.update({f"T{t}_HIST": hist[t - 1] if t <= n else 0 for t in range(1, 15)})

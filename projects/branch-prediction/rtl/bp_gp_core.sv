@@ -32,8 +32,23 @@
 //   formula. The history shifts in the outcome after training, on every
 //   conditional branch.
 //
-//   State kept between predict and update (project-wide rule): the row index
-//   and y in flops; the weight row is re-read from the SRAM when training.
+//   Predict -> update checkpoint (flops):
+//     idx_q    the row index
+//     decision DEC_CKPT = 0: y_q (Y_W bits); |y| <= THETA is evaluated at
+//              the update handshake.
+//              DEC_CKPT = 1: only the prediction and the |y| <= THETA flag
+//              (2 bits), evaluated when the row arrives (-THETA <= y <= THETA,
+//              two compares in parallel after the adder tree).
+//     taken_q  the outcome, for the write one cycle after the handshake
+//   The weight row is NOT checkpointed: that would be ROW_W flops captured on
+//   every prediction, against one extra row read per training event. When
+//   training, the row is re-read at idx_q. With several branches in flight
+//   (later) the re-read also sees the writes of older branches, so no update
+//   is lost to a stale copy; the training direction then needs the
+//   predict-time history, which here is ghr_q (one branch in flight).
+//   Unchanged rows are written back anyway: a training step leaves a row
+//   unchanged only if every weight is saturated toward the outcome, which
+//   needs (GHR_LEN+1) * (2^(WEIGHT_BITS-1) - 1) <= THETA.
 //
 //   Protocol (stage 1: non-speculative, ONE branch in flight):
 //     S_IDLE     - pred_req_ready_o = 1. A predict handshake registers the
@@ -41,18 +56,21 @@
 //                  (CBP5 TrackOtherInst) is also accepted here and ignored,
 //                  as g_perceptron.h does.
 //     S_IDX      - the row is read at the registered index.
-//     S_RD       - the row is valid; y is computed and latched. With
-//                  Y_REG = 0 the prediction is returned in this cycle.
+//     S_RD       - the row is valid; y is computed and the decision
+//                  checkpoint latched. With Y_REG = 0 the prediction is
+//                  returned in this cycle.
 //     S_PRED     - only with Y_REG = 1: the prediction is returned from the
-//                  registered y (one cycle later, shorter critical path).
+//                  checkpoint (one cycle later, shorter critical path).
 //     S_WAIT_UPD - waits for the CONDITIONAL update. Its handshake decides
-//                  training from y_q and the outcome. No training: the
-//                  history shifts and the core returns to S_IDLE (no SRAM
-//                  access). Training: the row is re-read at idx_q.
+//                  training from the checkpoint and the outcome. No
+//                  training: the history shifts and the core returns to
+//                  S_IDLE (no SRAM access). Training: the row is re-read at
+//                  idx_q.
 //     S_UPD      - the re-read row is valid: the stepped row is written back
 //                  and the history shifts.
 //   Cycles per conditional branch: 4 (no training) or 5 (training), plus one
-//   with Y_REG = 1. Unconditional branch: 1.
+//   with Y_REG = 1. Unconditional branch: 1. Per conditional branch: one row
+//   read, plus one read and one write per training event.
 //
 //   The re-read returns what g_perceptron.h reads in UpdatePredictor: with
 //   one branch in flight nothing writes the row in between, and the GHR used
@@ -67,8 +85,11 @@
 //   WEIGHT_BITS     - bits per weight (2..8)
 //   THETA_ALPHA_PCT - threshold scale in percent (1..1000)
 //   PC_SHIFT        - right shift of the PC before indexing (0..3)
-//   Y_REG           - 0: predict in the cycle the row arrives; 1: register y
-//                     first and predict one cycle later
+//   Y_REG           - 0: predict in the cycle the row arrives; 1: register
+//                     the decision first and predict one cycle later
+//   DEC_CKPT        - 0: checkpoint y (Y_W flops), threshold compare at the
+//                     update; 1: checkpoint 2 decision bits, threshold
+//                     compare when the row arrives
 //   MOD_RECIP       - index modulo: 1 reciprocal multiply (default), 0 the
 //                     generic divider (comparison only; very long path)
 //   PC_W            - PC / target width of the shared predictor interface
@@ -83,6 +104,7 @@ module bp_gp_core #(
     parameter int unsigned  THETA_ALPHA_PCT = 25,
     parameter int unsigned  PC_SHIFT        = 2,
     parameter bit           Y_REG           = 1'b0,
+    parameter bit           DEC_CKPT        = 1'b0,
     parameter bit           MOD_RECIP       = 1'b1,
     parameter int unsigned  PC_W            = 64,
     localparam int unsigned NUM_W           = GHR_LEN + 1,
@@ -159,8 +181,7 @@ module bp_gp_core #(
 
     state_e             state_q, state_d;
     logic [GHR_LEN-1:0] ghr_q;     // global history, newest outcome in bit 0
-    logic [  IDX_W-1:0] idx_q;     // row of the branch in flight
-    logic [    Y_W-1:0] y_q;       // its perceptron output (signed)
+    logic [  IDX_W-1:0] idx_q;     // checkpoint: row of the branch in flight
     logic               taken_q;   // its resolved direction
 
     // -------------------------------------------------------------------------
@@ -207,15 +228,45 @@ module bp_gp_core #(
     );
 
     // -------------------------------------------------------------------------
-    // Training decision (at the update handshake, from y_q and the outcome)
+    // Decision checkpoint (latched when the row arrives, S_RD) and the
+    // training decision (at the update handshake)
     // -------------------------------------------------------------------------
-    logic           pred_dir_q;   // the prediction that was returned
-    logic [Y_W-1:0] abs_y;
-    logic           train;
+    logic pred_dir;   // the prediction that was returned
+    logic low_conf;   // |y| <= THETA
+    logic train;
 
-    assign pred_dir_q = ~y_q[Y_W-1];
-    assign abs_y      = y_q[Y_W-1] ? (~y_q + Y_W'(1)) : y_q;
-    assign train      = (pred_dir_q != upd_taken_i) || (32'(abs_y) <= THETA);
+    if (DEC_CKPT) begin : g_ckpt_dec
+        localparam int THETA_S = int'(THETA);
+
+        logic signed [31:0] y_s;
+        logic               pred_dir_q;
+        logic               low_conf_q;
+
+        assign y_s = 32'($signed(y_comb));
+
+        always_ff @(posedge clk_i) begin
+            if (state_q == S_RD) begin
+                pred_dir_q <= ~y_comb[Y_W-1];
+                low_conf_q <= (y_s <= THETA_S) && (y_s >= -THETA_S);
+            end
+        end
+
+        assign pred_dir = pred_dir_q;
+        assign low_conf = low_conf_q;
+    end else begin : g_ckpt_y
+        logic [Y_W-1:0] y_q;     // perceptron output (signed)
+        logic [Y_W-1:0] abs_y;
+
+        always_ff @(posedge clk_i) begin
+            if (state_q == S_RD) y_q <= y_comb;
+        end
+
+        assign pred_dir = ~y_q[Y_W-1];
+        assign abs_y    = y_q[Y_W-1] ? (~y_q + Y_W'(1)) : y_q;
+        assign low_conf = (32'(abs_y) <= THETA);
+    end
+
+    assign train = (pred_dir != upd_taken_i) || low_conf;
 
     // -------------------------------------------------------------------------
     // Handshakes
@@ -228,7 +279,7 @@ module bp_gp_core #(
 
     if (Y_REG) begin : g_resp_reg
         assign pred_resp_valid_o = (state_q == S_PRED);
-        assign pred_resp_taken_o = ~y_q[Y_W-1];
+        assign pred_resp_taken_o = pred_dir;
     end else begin : g_resp_comb
         assign pred_resp_valid_o = (state_q == S_RD);
         assign pred_resp_taken_o = ~y_comb[Y_W-1];
@@ -302,7 +353,6 @@ module bp_gp_core #(
     // Datapath registers: no reset (always written before they are used).
     always_ff @(posedge clk_i) begin
         if (pred_fire)         idx_q   <= pred_idx;
-        if (state_q == S_RD)   y_q     <= y_comb;
         if (upd_cond_fire)     taken_q <= upd_taken_i;
     end
 

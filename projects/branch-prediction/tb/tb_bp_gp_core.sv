@@ -21,6 +21,7 @@
 //   THETA_ALPHA_PCT - threshold scale in percent (must match the DUT and dump)
 //   PC_SHIFT        - PC shift before indexing (must match the DUT and dump)
 //   Y_REG           - DUT prediction timing (RTL only; baked into a netlist)
+//   DEC_CKPT        - DUT decision checkpoint (RTL only; baked into a netlist)
 //   MOD_RECIP       - DUT index modulo style (RTL only; baked into a netlist)
 //   STIM_FILE       - default stimulus path ("" = +STIM=<path> required)
 //   MAX_LINES       - stop after this many branch lines (0 = whole file)
@@ -50,6 +51,7 @@ module tb_bp_gp_core #(
     parameter int unsigned THETA_ALPHA_PCT = 25,
     parameter int unsigned PC_SHIFT        = 2,
     parameter bit          Y_REG           = 1'b0,
+    parameter bit          DEC_CKPT        = 1'b0,
     parameter bit          MOD_RECIP       = 1'b1,
     parameter string       STIM_FILE       = "",
     parameter int unsigned MAX_LINES       = 0,
@@ -100,6 +102,7 @@ module tb_bp_gp_core #(
         .THETA_ALPHA_PCT  (THETA_ALPHA_PCT),
         .PC_SHIFT         (PC_SHIFT),
         .Y_REG            (Y_REG),
+        .DEC_CKPT         (DEC_CKPT),
         .MOD_RECIP        (MOD_RECIP),
         .PC_W             (PC_W)
     ) dut (
@@ -146,16 +149,17 @@ module tb_bp_gp_core #(
     // Bench-specific strings for the shared body
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("GHR_LEN=%0d NUM_PERCEPTRONS=%0d WEIGHT_BITS=%0d THETA_ALPHA_PCT=%0d PC_SHIFT=%0d Y_REG=%0d MOD_RECIP=%0d",
-                         GHR_LEN, NUM_PERCEPTRONS, WEIGHT_BITS, THETA_ALPHA_PCT, PC_SHIFT, Y_REG, MOD_RECIP);
+        return $sformatf("GHR_LEN=%0d NUM_PERCEPTRONS=%0d WEIGHT_BITS=%0d THETA_ALPHA_PCT=%0d PC_SHIFT=%0d Y_REG=%0d DEC_CKPT=%0d MOD_RECIP=%0d",
+                         GHR_LEN, NUM_PERCEPTRONS, WEIGHT_BITS, THETA_ALPHA_PCT, PC_SHIFT, Y_REG, DEC_CKPT, MOD_RECIP);
     endfunction
 
     function automatic string tb_debug();
 `ifdef POST_SYN_SIM
         return "";
 `else
-        // y_comb, not y_q: with Y_REG = 0, y_q is latched only on the edge
-        // after the response; the row read data (and so y_comb) stays valid.
+        // y_comb, not a checkpoint register: with Y_REG = 0 the checkpoint is
+        // latched only on the edge after the response; the row read data (and
+        // so y_comb) stays valid.
         return $sformatf("ghr %h row %0d y %0d", dut.ghr_q, dut.idx_q, $signed(dut.y_comb));
 `endif
     endfunction

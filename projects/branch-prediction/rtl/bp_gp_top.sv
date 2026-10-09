@@ -20,6 +20,7 @@
 //   THETA_ALPHA_PCT - threshold scale in percent (1..1000)
 //   PC_SHIFT        - right shift of the PC before indexing (0..3)
 //   Y_REG           - 0: predict in the cycle the row arrives; 1: one later
+//   DEC_CKPT        - 0: checkpoint y; 1: checkpoint 2 decision bits
 //   MOD_RECIP       - index modulo: 1 reciprocal multiply, 0 generic divider
 //   PC_W            - PC / target width of the shared predictor interface
 // -----------------------------------------------------------------------------
@@ -33,6 +34,7 @@ module bp_gp_top #(
     parameter int unsigned THETA_ALPHA_PCT = 25,
     parameter int unsigned PC_SHIFT        = 2,
     parameter bit          Y_REG           = 1'b0,
+    parameter bit          DEC_CKPT        = 1'b0,
     parameter bit          MOD_RECIP       = 1'b1,
     parameter int unsigned PC_W            = 64
 ) (
@@ -72,6 +74,7 @@ module bp_gp_top #(
         .THETA_ALPHA_PCT  (THETA_ALPHA_PCT),
         .PC_SHIFT         (PC_SHIFT),
         .Y_REG            (Y_REG),
+        .DEC_CKPT         (DEC_CKPT),
         .MOD_RECIP        (MOD_RECIP),
         .PC_W             (PC_W)
     ) i_core (
