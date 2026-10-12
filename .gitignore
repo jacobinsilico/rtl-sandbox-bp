@@ -12,3 +12,5 @@ __pycache__
 *.lock.hjson
 /projects/branch-prediction/eval
 /projects/branch-prediction/stim
+/projects/branch-prediction/yosys_block_diagram
+*.log
