@@ -13,4 +13,5 @@ __pycache__
 /projects/branch-prediction/eval
 /projects/branch-prediction/stim
 /projects/branch-prediction/yosys_block_diagram
+/projects/branch-prediction/drawio_block_diagram
 *.log
