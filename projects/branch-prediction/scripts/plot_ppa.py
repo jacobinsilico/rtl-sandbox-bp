@@ -6,7 +6,8 @@
 # Description:
 #   Accuracy and logic PPA of the four predictors vs storage budget, from the
 #   results evaluate.py / campaign.py wrote (one row per predictor x budget x
-#   trace). Each figure has one legend, shared by all its columns.
+#   trace). Each figure has one legend, shared by all its columns, and the
+#   x label under every column.
 #
 #     mpkbr_<scale>   MPKBr, one column per trace (no bands)
 #     energy_<scale>  logic energy per conditional branch, one column per
@@ -44,6 +45,7 @@
 #                      the energy columns
 #     --period-ns NS   clock period of the gate-level runs for the energy
 #                      (default: read from each row, see PERIOD_COLS)
+#     --max-kb KB      plot only budgets up to KB (default: all budgets)
 #     --out DIR        default eval/plots/
 #     --format FMT     png | pdf | svg (default png)
 #
@@ -51,6 +53,7 @@
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --format pdf --sharey
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --period-ns 1.0
+#     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --max-kb 16
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --csv projects/branch-prediction/eval/campaign_full.csv
 #
 # Output:
@@ -308,10 +311,10 @@ def figure(panels, log, sharey, path):
         budget_axis(ax, budgets)
         log_y(ax) if log else linear_y(ax)
         ax.set_title(title, fontsize=11)
+        ax.set_xlabel(X_LABEL)
         if ylabel:
             ax.set_ylabel(ylabel)
-    fig.tight_layout(rect=(0, 0.62 / h, 1, 1))            # bottom 0.62 in: x label + legend
-    fig.text(0.5, 0.45 / h, X_LABEL, ha="center", va="center", fontsize=11)
+    fig.tight_layout(rect=(0, 0.4 / h, 1, 1))             # bottom 0.4 in: legend
     handles = [Line2D([], [], color=c, marker=m, lw=1.8, ms=6, label=lab)
                for p, (lab, c, m) in STYLE.items() if p in drawn]
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0),
@@ -333,6 +336,8 @@ def main():
                     help="one y range across the MPKBr columns, and one across the energy columns")
     ap.add_argument("--period-ns", type=float, default=None,
                     help="clock period of the gate-level runs (default: from each row)")
+    ap.add_argument("--max-kb", type=float, default=None,
+                    help="plot only budgets up to this many KB (default: all)")
     ap.add_argument("--out", default=os.path.join(EVAL_DIR, "plots"))
     ap.add_argument("--format", default="png", choices=["png", "pdf", "svg"])
     a = ap.parse_args()
@@ -347,8 +352,11 @@ def main():
     if bad:
         sys.exit(f"no such CSV: {' '.join(bad)}")
     rows = load(paths)
+    if a.max_kb is not None:
+        rows = {k: r for k, r in rows.items() if k[1] <= a.max_kb}
     if not rows:
-        sys.exit(f"no usable rows in {' '.join(paths)}")
+        sys.exit(f"no usable rows in {' '.join(paths)}"
+                 + (f" up to {a.max_kb:g} KB" if a.max_kb is not None else ""))
     have = sorted({t for _, _, t in rows})
     traces = [t for t in a.traces if t in have]
     if len(traces) < len(a.traces):
