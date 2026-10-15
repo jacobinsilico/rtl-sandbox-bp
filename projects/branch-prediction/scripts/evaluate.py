@@ -484,6 +484,116 @@ def parse_power(out_dir):
 # One budget: its dumps, its steps and their records
 # =============================================================================
 
+# =============================================================================
+# VCD post-processing for the power analysis
+# =============================================================================
+
+VCD_MAX_BUS = 64    # OpenSTA's VCD reader holds a bus value in a 64-bit integer
+
+
+def _vcd_ids():
+    """Fresh VCD identifiers (printable ASCII 33..126), shortest first."""
+    n = 0
+    while True:
+        k, s = n, ""
+        while True:
+            s = chr(33 + k % 94) + s
+            k = k // 94 - 1
+            if k < 0:
+                break
+        yield s
+        n += 1
+
+
+def split_wide_vcd(path, max_bus=VCD_MAX_BUS):
+    """Rewrite a VCD so that no bus is wider than max_bus: each wider variable
+    becomes one 1-bit variable per element (name [i]), and each of its value
+    changes becomes changes of only the bits that changed. The switching
+    activity per bit is unchanged; only the representation differs. In place
+    (via a temporary file); returns the number of variables split (0: the file
+    is left alone)."""
+    wide, defs = {}, []
+    with open(path, errors="replace") as f:
+        for line in f:
+            if line.startswith("$enddefinitions") or "$enddefinitions" in line:
+                break
+            t = line.split()
+            if len(t) >= 5 and t[0] == "$var" and t[2].isdigit() and int(t[2]) > max_bus:
+                wide.setdefault(t[3], int(t[2]))
+    if not wide:
+        return 0
+    used, gen = set(), _vcd_ids()
+    with open(path, errors="replace") as f:          # every identifier in use
+        for line in f:
+            if "$enddefinitions" in line:
+                break
+            t = line.split()
+            if len(t) >= 4 and t[0] == "$var":
+                used.add(t[3])
+
+    def fresh():
+        while True:
+            i = next(gen)
+            if i not in used:
+                used.add(i)
+                return i
+
+    bits = {}                                        # wide id -> [new id per character]
+    prev = {}                                        # wide id -> last full value
+    tmp = path + ".split.tmp"
+    with open(path, errors="replace") as f, open(tmp, "w", buffering=1 << 22) as o:
+        for line in f:                               # header
+            t = line.split()
+            if len(t) >= 5 and t[0] == "$var" and t[3] in wide:
+                vid, width = t[3], wide[t[3]]
+                name, rng = t[4], (t[5] if len(t) > 6 and t[5].startswith("[") else "")
+                if not rng and "[" in name:
+                    name, rng = name[:name.index("[")], name[name.index("["):]
+                msb, lsb = width - 1, 0
+                if rng.startswith("[") and ":" in rng:
+                    msb, lsb = (int(x) for x in rng.strip("[]").split(":"))
+                ids = bits.setdefault(vid, [fresh() for _ in range(width)])
+                for c in range(width):               # character c = bit msb -/+ c
+                    idx = msb - c if msb >= lsb else msb + c
+                    o.write(f"$var {t[1]} 1 {ids[c]} {name} [{idx}] $end\n")
+                continue
+            o.write(line)
+            if "$enddefinitions" in line:
+                break
+        write = o.write
+        for line in f:                               # value changes
+            if line[0] not in "bB":
+                write(line)
+                continue
+            val, _, vid = line[1:].rstrip("\n").rpartition(" ")
+            ids = bits.get(vid.strip())
+            if ids is None:
+                write(line)
+                continue
+            vid = vid.strip()
+            width = len(ids)
+            if len(val) < width:                     # IEEE left extension
+                val = (val[0] if val[0] in "xXzZ" else "0") * (width - len(val)) + val
+            old = prev.get(vid)
+            prev[vid] = val
+            if old is None:
+                write("".join([val[c] + ids[c] + "\n" for c in range(width)]))
+            elif "x" in val or "z" in val or "x" in old or "z" in old \
+                    or "X" in val or "Z" in val or "X" in old or "Z" in old:
+                write("".join([val[c] + ids[c] + "\n" for c in range(width) if val[c] != old[c]]))
+            else:                                    # 0/1 only: walk the changed bits
+                d = int(val, 2) ^ int(old, 2)
+                out = []
+                while d:
+                    low = d & -d
+                    c = width - low.bit_length()     # character position of that bit
+                    out.append(val[c] + ids[c] + "\n")
+                    d ^= low
+                write("".join(out))
+    os.replace(tmp, path)
+    return len(wide)
+
+
 def make(args, target, variables, logfile):
     cmd = ["make", "-C", REPO, target, f"PROJECT={PROJECT}"] + [f"{k}={v}" for k, v in variables]
     if args.dry_run:
@@ -594,6 +704,9 @@ class Budget:
             key = self.key(step) if key is None else key
         except ValueError:
             return False
+        if rec is not None and step.startswith("dpa_") \
+                and (rec.get("metrics") or {}).get("p_total_w") is None:
+            return False                     # an older flow accepted a DPA without power
         return rec is not None and rec.get("status") == "ok" and rec.get("key") == key \
             and not self.args.rerun
 
@@ -705,10 +818,20 @@ class Budget:
         else:  # dpa
             var = base + [("OUT_DIR", f"dpa_{self.tag}_{trace}"), ("NETLIST_DIR", f"syn_{self.tag}"),
                           ("VCD_DIR", f"gls_{self.tag}_{trace}"), ("IO_DELAY_PCT", a.io_delay_pct)]
-            rc, _ = make(a, "post-syn-dpa", var, logf)
+            n_split = 0
+            if not a.dry_run:                        # buses > 64 bits break OpenSTA's read_vcd
+                n_split = sum(split_wide_vcd(v) for v in self.vcds(trace))
+            rc, text = make(a, "post-syn-dpa", var, logf)
             ok = rc == 0
             m = parse_power(f"dpa_{self.tag}_{trace}") if ok and not a.dry_run else {}
             m["clk_ns"] = a.clk
+            m["vcd_split_vars"] = n_split
+            if ok and not a.dry_run and m.get("p_total_w") is None:
+                # make can exit 0 although the power tool died (its exit status
+                # is lost in the pipe to tee): no power, no ok -- the VCD stays
+                ok = False
+                errs = [l.strip() for l in (text or "").splitlines() if l.startswith("Error")]
+                m["error"] = errs[0] if errs else "no power in the report (the power tool did not finish?)"
             if ok and not a.dry_run and not a.keep_vcd:
                 if a.keep_sim:
                     for v in self.vcds(trace):
@@ -727,7 +850,9 @@ class Budget:
             extra += f"  {m['error']}" if m.get("error") else ""
             return (f"{'ok' if ok else 'FAILED'}  lines={m.get('lines')} cond={m.get('cond_br')} "
                     f"mispred={m.get('rtl_mispred')}{extra}" + ("" if ok else f"  (see {logf})"))
-        return "ok" if ok else f"FAILED (exit {rc}, see {logf})"
+        if ok:
+            return "ok"
+        return f"FAILED ({m['error']}, see {logf})" if m.get("error") else f"FAILED (exit {rc}, see {logf})"
 
     def run(self):
         """All requested steps of this budget; True if all of them are ok."""

@@ -149,8 +149,17 @@ class Job:
 
     # ---- state on disk ----
     def finished(self):
+        """Marked complete with these options, AND its records still pass
+        today's checks (a marker from an older, laxer flow vouches for
+        nothing: e.g. a DPA record without power)."""
         m = load_json(os.path.join(self.dest, MARKER))
-        return bool(m) and m.get("complete") and m.get("options") == self.opts
+        if not (bool(m) and m.get("complete") and m.get("options") == self.opts):
+            return False
+        probs = self.check(0)
+        if probs:
+            log(f"    marked done, but its records fail today's checks ({probs[0]}"
+                f"{f' and {len(probs) - 1} more' if len(probs) > 1 else ''}): redone")
+        return not probs
 
     def metas(self, d):
         """trace -> dump metadata: the .json files with a matching .log."""
@@ -259,6 +268,9 @@ class Job:
                     if (mm.get("win_start"), mm.get("win_lines")) != (start, n):
                         probs.append(f"gls_{short}: window {mm.get('win_start')}+{mm.get('win_lines')}, "
                                      f"expected {start}+{n}")
+            if "dpa" in a.steps and rec(f"dpa_{short}").get("status") == "ok" \
+                    and rec(f"dpa_{short}").get("metrics", {}).get("p_total_w") is None:
+                probs.append(f"dpa_{short}: ok but no power in its record")
             if "dpa" in a.steps and rec(f"dpa_{short}").get("status") != "ok":
                 probs.append(f"dpa_{short}: {rec(f'dpa_{short}').get('status', 'no record')}")
         return probs
