@@ -4,25 +4,33 @@
 //
 // Description:
 //   Self-checking testbench for bp_gp_core (global perceptron), driven by a
-//   g_perceptron golden dump from the patched CBP5 harness. The DUT instance
-//   is named dut and is the synthesized unit; the weight table is the
-//   behavioral bp_sram instantiated here, next to dut (NUM_PERCEPTRONS rows of
-//   (GHR_LEN+1)*WEIGHT_BITS bits, all zero), so the same bench runs the RTL
-//   and, with POST_SYN_SIM, the synthesized/routed netlist (plain vector
-//   ports: the branch only drops the parameters). Stimulus, checking, drain,
-//   report and VCD come from tb_bp_common.svh.
+//   g_perceptron_rtl golden dump from the patched CBP5 harness. The DUT
+//   instance is named dut and is the synthesized unit; the weight table is
+//   the behavioral bp_sram instantiated here, next to dut (NUM_PERCEPTRONS
+//   rows of (GHR_LEN+1)*WEIGHT_BITS bits, all zero), so the same bench runs
+//   the RTL and, with POST_SYN_SIM, the synthesized/routed netlist (plain
+//   vector ports: the branch only drops the parameters). Stimulus, checking,
+//   drain, report and VCD come from tb_bp_common.svh; its predict / update
+//   tasks wait on the handshakes, so the DUT's latency (1 + PSUM_REG + Y_REG
+//   cycles) needs nothing here.
+//
+//   The pipeline knobs (INDEX_FOLD aside) do not change any prediction. Their
+//   defaults here equal bp_gp_core's: an RTL run without overrides checks the
+//   same configuration that synthesis builds from the core's defaults.
 //
 //   The stimulus file is given with +STIM=<path> or the STIM_FILE parameter.
 //
 // Parameters:
 //   GHR_LEN         - global history length (must match the DUT and the dump)
-//   NUM_PERCEPTRONS - table rows (must match the DUT and the dump)
+//   NUM_PERCEPTRONS - table rows, a power of two (must match the DUT and dump)
 //   WEIGHT_BITS     - bits per weight (must match the DUT and the dump)
 //   THETA_ALPHA_PCT - threshold scale in percent (must match the DUT and dump)
 //   PC_SHIFT        - PC shift before indexing (must match the DUT and dump)
+//   INDEX_FOLD      - row index: 0 low bits, 1 XOR fold (must match the dump)
+//   PSUM_REG        - DUT partial-sum register (RTL only; baked into a netlist)
+//   PSUM_GROUPS     - DUT group trees (RTL only; baked into a netlist)
 //   Y_REG           - DUT prediction timing (RTL only; baked into a netlist)
 //   DEC_CKPT        - DUT decision checkpoint (RTL only; baked into a netlist)
-//   MOD_RECIP       - DUT index modulo style (RTL only; baked into a netlist)
 //   STIM_FILE       - default stimulus path ("" = +STIM=<path> required)
 //   MAX_LINES       - stop after this many branch lines (0 = whole file)
 //   TIMEOUT_CYCLES  - max cycles to wait for a ready or valid
@@ -46,13 +54,15 @@
 
 module tb_bp_gp_core #(
     parameter int unsigned GHR_LEN         = 18,
-    parameter int unsigned NUM_PERCEPTRONS = 287,
+    parameter int unsigned NUM_PERCEPTRONS = 256,
     parameter int unsigned WEIGHT_BITS     = 6,
     parameter int unsigned THETA_ALPHA_PCT = 25,
     parameter int unsigned PC_SHIFT        = 2,
+    parameter bit          INDEX_FOLD      = 1'b0,
+    parameter bit          PSUM_REG        = 1'b1,
+    parameter int unsigned PSUM_GROUPS     = 8,
     parameter bit          Y_REG           = 1'b0,
-    parameter bit          DEC_CKPT        = 1'b0,
-    parameter bit          MOD_RECIP       = 1'b1,
+    parameter bit          DEC_CKPT        = 1'b1,
     parameter string       STIM_FILE       = "",
     parameter int unsigned MAX_LINES       = 0,
     parameter int unsigned TIMEOUT_CYCLES  = 100
@@ -101,9 +111,11 @@ module tb_bp_gp_core #(
         .WEIGHT_BITS      (WEIGHT_BITS),
         .THETA_ALPHA_PCT  (THETA_ALPHA_PCT),
         .PC_SHIFT         (PC_SHIFT),
+        .INDEX_FOLD       (INDEX_FOLD),
+        .PSUM_REG         (PSUM_REG),
+        .PSUM_GROUPS      (PSUM_GROUPS),
         .Y_REG            (Y_REG),
         .DEC_CKPT         (DEC_CKPT),
-        .MOD_RECIP        (MOD_RECIP),
         .PC_W             (PC_W)
     ) dut (
 `endif
@@ -149,17 +161,18 @@ module tb_bp_gp_core #(
     // Bench-specific strings for the shared body
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("GHR_LEN=%0d NUM_PERCEPTRONS=%0d WEIGHT_BITS=%0d THETA_ALPHA_PCT=%0d PC_SHIFT=%0d Y_REG=%0d DEC_CKPT=%0d MOD_RECIP=%0d",
-                         GHR_LEN, NUM_PERCEPTRONS, WEIGHT_BITS, THETA_ALPHA_PCT, PC_SHIFT, Y_REG, DEC_CKPT, MOD_RECIP);
+        return $sformatf("GHR_LEN=%0d NUM_PERCEPTRONS=%0d WEIGHT_BITS=%0d THETA_ALPHA_PCT=%0d PC_SHIFT=%0d INDEX_FOLD=%0d PSUM_REG=%0d PSUM_GROUPS=%0d Y_REG=%0d DEC_CKPT=%0d",
+                         GHR_LEN, NUM_PERCEPTRONS, WEIGHT_BITS, THETA_ALPHA_PCT, PC_SHIFT, INDEX_FOLD,
+                         PSUM_REG, PSUM_GROUPS, Y_REG, DEC_CKPT);
     endfunction
 
     function automatic string tb_debug();
 `ifdef POST_SYN_SIM
         return "";
 `else
-        // y_comb, not a checkpoint register: with Y_REG = 0 the checkpoint is
-        // latched only on the edge after the response; the row read data (and
-        // so y_comb) stays valid.
+        // y_comb, not a checkpoint register: it stays valid after the response
+        // (the row read data and the partial-sum register hold until the next
+        // read / row).
         return $sformatf("ghr %h row %0d y %0d", dut.ghr_q, dut.idx_q, $signed(dut.y_comb));
 `endif
     endfunction

@@ -11,8 +11,10 @@
 //   tables are SRAMs outside this module; their ports are its I/O.
 //
 //   Prediction (GetPrediction): every index is hashed from the PC and the
-//   history (bp_hp_hash per table; bias: XOR-fold of pcmix(pc)) and
-//   registered before the table read, as in bp_gp_core. Then
+//   history (bp_hp_hash per table; bias: XOR-fold of pcmix(pc)) in the
+//   predict-handshake cycle. IDX_REG = 0: the tables are read on that edge
+//   (as bp_gshare_core / bp_gp_core); IDX_REG = 1: the indices are registered
+//   first and the tables read one cycle later (S_IDX). Then
 //     y = bias + sum_t W_t[idx_t]   (bp_add_tree), predict taken iff y >= 0.
 //
 //   Update (UpdatePredictor), all in the update-handshake cycle, in the C++
@@ -24,32 +26,52 @@
 //     history push: global history, path history, folded histories.
 //   Unconditional branches (TrackOtherInst) change nothing, as in the C++.
 //
+//   Short update path: everything the handshake cycle needs except the
+//   outcome is ready before it. DEC_CKPT = 1 decides |y| <= theta when y is
+//   formed (S_RD; theta only changes at the update, so it is the same
+//   theta), leaving mispredicted = (prediction != outcome) as the only
+//   input-dependent term of train. A write enable is formed from the
+//   checkpointed weight and the outcome alone: the step changes the weight
+//   unless it already sits at the limit of the outcome's direction
+//   (taken ? w != max : w != min), identical to comparing the stepped weight
+//   with the old one, without the step in front of the compare.
+//
 //   Table ports: table t uses address bits [AOFF(t) +: LOG_t] and data bits
 //   [DOFF(t) +: WBITS_t] of the packed wt_* vectors (AOFF / DOFF = sum of
 //   the widths of the tables before t), so the port widths are exact.
 //
 //   Predict -> update checkpoint (flops): the indices (bidx_q, idx_q), y
-//   (y_q) and the weights read at predict (bw_q, w_q: BIAS_WEIGHT_BITS +
-//   sum of T<i>_WBITS bits). The tables are read once per conditional
-//   branch and never re-read: a re-read would cost one access per table
-//   (NUM_TABLES + 1) per training event, against a few flops per table.
-//   Bit-exact with one branch in flight: nothing writes a table between
-//   predict and update, and theta only changes at the update. A skipped
-//   write would have stored the value the entry already holds.
+//   (y_q; with DEC_CKPT = 1 only its sign bit is used and synthesis drops
+//   the rest), the |y| <= theta flag (low_conf_q, DEC_CKPT = 1) and the
+//   weights read at predict (bw_q, w_q: BIAS_WEIGHT_BITS + sum of T<i>_WBITS
+//   bits). The tables are read once per conditional branch and never
+//   re-read: a re-read would cost one access per table (NUM_TABLES + 1) per
+//   training event, against a few flops per table. Bit-exact with one branch
+//   in flight: nothing writes a table between predict and update, and theta
+//   only changes at the update. A skipped write would have stored the value
+//   the entry already holds.
 //
 //   Protocol (non-speculative, ONE branch in flight, as bp_gp_core):
-//     S_IDLE - predict handshake registers every index; an unconditional
-//              update is accepted and ignored.
-//     S_IDX  - every table is read at the registered indices.
-//     S_RD   - y and the weights are latched (Y_REG = 0: prediction
-//              returned).
+//     S_IDLE - predict handshake: indices hashed; IDX_REG = 0 the tables are
+//              read on this edge, IDX_REG = 1 the indices are registered. An
+//              unconditional update is accepted and ignored.
+//     S_IDX  - only with IDX_REG = 1: every table is read at the registered
+//              indices.
+//     S_RD   - y, the decision flag and the weights are latched (Y_REG = 0:
+//              prediction returned).
 //     S_PRED - only with Y_REG = 1: prediction from the registered y.
 //     S_WAIT - conditional update handshake: write-back of the changed
 //              weights (training), theta update and history push; back to
 //              S_IDLE.
-//   Cycles per conditional branch: 4, plus one with Y_REG = 1. Unconditional
-//   branch: 1. Per conditional branch NUM_TABLES + 1 table reads; writes only
-//   for weights that change.
+//   Prediction latency (predict handshake -> pred_resp_valid_o): 1 + IDX_REG
+//   + Y_REG cycles. Cycles per conditional branch: 3 + IDX_REG + Y_REG.
+//   Unconditional branch: 1. Per conditional branch NUM_TABLES + 1 table
+//   reads; writes only for weights that change.
+//
+//   The knobs change no prediction: a cycle-accurate model of this core was
+//   checked equivalent (predictions, theta / TC trace, tables, histories,
+//   access counts) to the core with IDX_REG = 1, DEC_CKPT = 0, Y_REG = 0, for
+//   every knob combination over random geometries.
 //
 //   Not modeled (stage 1): several branches in flight. The checkpointed
 //   weights would then be stale when an older in-flight branch trained the
@@ -71,6 +93,10 @@
 //   HP_PATH_BITS       - path history width (0..31; 0 = none)
 //   HP_PCMIX           - 1: q ^ (q >> 3), q = pc >> HP_PC_SHIFT; 0: pc ^ pc>>2
 //   HP_PC_SHIFT        - PC shift of HP_PCMIX = 1 (0..4)
+//   IDX_REG            - 0: read the tables on the predict handshake; 1:
+//                        register the indices first, read one cycle later
+//   DEC_CKPT           - 1: decide |y| <= theta when y is formed (1 flop);
+//                        0: decide it from y_q at the update handshake
 //   Y_REG              - 0: predict in the cycle the weights arrive; 1: one
 //                        cycle later from the registered y
 //   PC_W               - PC / target width of the shared interface (64)
@@ -112,6 +138,8 @@ module bp_hp_core #(
     parameter int unsigned  HP_PATH_BITS     = 16,
     parameter int unsigned  HP_PCMIX         = 1,
     parameter int unsigned  HP_PC_SHIFT      = 2,
+    parameter bit           IDX_REG          = 1'b0,
+    parameter bit           DEC_CKPT         = 1'b1,
     parameter bit           Y_REG            = 1'b0,
     parameter int unsigned  PC_W             = 64,
     localparam int unsigned BIAS_LOG         = $clog2(BIAS_ENTRIES),
@@ -262,6 +290,8 @@ module bp_hp_core #(
     localparam int unsigned THETA_MAX  = (1 << THETA_BITS) - 1;
     localparam logic [TC_BITS-1:0] TC_MAX = {1'b0, {(TC_BITS - 1){1'b1}}};
     localparam logic [TC_BITS-1:0] TC_MIN = {1'b1, {(TC_BITS - 1){1'b0}}};
+    localparam logic [BIAS_WEIGHT_BITS-1:0] BW_MAX = {1'b0, {(BIAS_WEIGHT_BITS - 1){1'b1}}};
+    localparam logic [BIAS_WEIGHT_BITS-1:0] BW_MIN = {1'b1, {(BIAS_WEIGHT_BITS - 1){1'b0}}};
 
     // -------------------------------------------------------------------------
     // Elaboration checks (as hp_core.h, plus the RTL limits)
@@ -448,17 +478,37 @@ module bp_hp_core #(
     // -------------------------------------------------------------------------
     // Training decision and theta adaptation (both with the old theta)
     // -------------------------------------------------------------------------
-    logic           pred_dir_q;     // perceptron prediction of the branch
-    logic [Y_W-1:0] abs_y;          // |y| as unsigned (exact also for -2^(Y_W-1))
-    logic           low_conf;       // |y| <= theta
-    logic           train;
-    logic           mispred;
+    logic pred_dir_q;     // perceptron prediction of the branch
+    logic low_conf;       // |y| <= theta
+    logic train;
+    logic mispred;
 
     assign pred_dir_q = ~y_q[Y_W-1];
-    assign abs_y      = y_q[Y_W-1] ? (~y_q + Y_W'(1)) : y_q;
-    assign low_conf   = (32'(abs_y) <= 32'(theta_q));
-    assign mispred    = (pred_dir_q != upd_taken_i);
-    assign train      = mispred || low_conf;
+
+    if (DEC_CKPT) begin : g_dec_rd
+        // decided when y is formed (S_RD); theta does not change before the
+        // update of this branch
+        logic signed [31:0] y_s;
+        logic signed [31:0] th_s;
+        logic               low_conf_q;
+
+        assign y_s  = 32'($signed(y_comb));
+        assign th_s = 32'(theta_q);           // THETA_BITS <= 30: non-negative
+
+        always_ff @(posedge clk_i) begin
+            if (state_q == S_RD) low_conf_q <= (y_s <= th_s) && (y_s >= -th_s);
+        end
+
+        assign low_conf = low_conf_q;
+    end else begin : g_dec_upd
+        logic [Y_W-1:0] abs_y;    // |y| as unsigned (exact also for -2^(Y_W-1))
+
+        assign abs_y    = y_q[Y_W-1] ? (~y_q + Y_W'(1)) : y_q;
+        assign low_conf = (32'(abs_y) <= 32'(theta_q));
+    end
+
+    assign mispred = (pred_dir_q != upd_taken_i);
+    assign train   = mispred || low_conf;
 
     logic [THETA_BITS-1:0] theta_d;
     logic [   TC_BITS-1:0] tc_d, tc_inc, tc_dec;
@@ -489,19 +539,30 @@ module bp_hp_core #(
     end
 
     // -------------------------------------------------------------------------
-    // Tables: read once at predict (registered indices); when training, each
-    // checkpointed weight steps toward the outcome and is written back in the
-    // handshake cycle if it changed
+    // Tables: read once at predict; when training, each checkpointed weight
+    // steps toward the outcome and is written back in the handshake cycle if
+    // it changed (it is not already at the limit of the outcome's direction)
     // -------------------------------------------------------------------------
     logic                        wr_en;
     logic [BIAS_WEIGHT_BITS-1:0] bias_new;
+    logic                        bias_chg;
     logic [        DATA_TOT-1:0] w_new;
     logic [      NUM_TABLES-1:0] w_chg;
 
     assign wr_en = upd_cond_fire && train;
 
-    assign bias_re_o    = (state_q == S_IDX);
-    assign bias_raddr_o = bidx_q;
+    if (IDX_REG) begin : g_rd_reg
+        assign bias_re_o    = (state_q == S_IDX);
+        assign bias_raddr_o = bidx_q;
+        assign wt_re_o      = {NUM_TABLES{state_q == S_IDX}};
+        assign wt_raddr_o   = idx_q;
+    end else begin : g_rd_hs
+        assign bias_re_o    = pred_fire;
+        assign bias_raddr_o = bidx_d;
+        assign wt_re_o      = {NUM_TABLES{pred_fire}};
+        assign wt_raddr_o   = idx_d;
+    end
+
     assign bias_waddr_o = bidx_q;
 
     bp_sat_ctr #(
@@ -513,12 +574,16 @@ module bp_hp_core #(
         .ctr_o (bias_new)
     );
 
-    assign bias_we_o    = wr_en && (bias_new != bw_q);
+    assign bias_chg     = upd_taken_i ? (bw_q != BW_MAX) : (bw_q != BW_MIN);
+    assign bias_we_o    = wr_en && bias_chg;
     assign bias_wdata_o = bias_new;
 
     for (genvar t = 0; t < NUM_TABLES; t++) begin : g_step
-        localparam int unsigned WB = t_wbits(t);
-        localparam int unsigned DO = d_off(t);
+        localparam int unsigned   WB    = t_wbits(t);
+        localparam int unsigned   DO    = d_off(t);
+        localparam logic [WB-1:0] W_MAX = {1'b0, {(WB - 1){1'b1}}};
+        localparam logic [WB-1:0] W_MIN = {1'b1, {(WB - 1){1'b0}}};
+
         bp_sat_ctr #(
             .WIDTH (WB),
             .SIGNED(1'b1)
@@ -527,11 +592,17 @@ module bp_hp_core #(
             .inc_i (upd_taken_i),
             .ctr_o (w_new[DO +: WB])
         );
-        assign w_chg[t] = (w_new[DO +: WB] != w_q[DO +: WB]);
+        assign w_chg[t] = upd_taken_i ? (w_q[DO +: WB] != W_MAX) : (w_q[DO +: WB] != W_MIN);
+
+`ifdef VERILATOR
+        // the limit test equals comparing the stepped weight with the old one
+        always_ff @(posedge clk_i) begin
+            if (rst_ni && state_q == S_WAIT && w_chg[t] != (w_new[DO +: WB] != w_q[DO +: WB]))
+                $error("bp_hp_core: write enable of table %0d differs from the step", t);
+        end
+`endif
     end
 
-    assign wt_re_o    = {NUM_TABLES{state_q == S_IDX}};
-    assign wt_raddr_o = idx_q;
     assign wt_we_o    = {NUM_TABLES{wr_en}} & w_chg;
     assign wt_waddr_o = idx_q;
     assign wt_wdata_o = w_new;
@@ -553,7 +624,7 @@ module bp_hp_core #(
     always_comb begin
         state_d = state_q;
         case (state_q)
-            S_IDLE: if (pred_fire)     state_d = S_IDX;
+            S_IDLE: if (pred_fire)     state_d = IDX_REG ? S_IDX : S_RD;
             S_IDX:                     state_d = S_RD;
             S_RD:                      state_d = Y_REG ? S_PRED : S_WAIT;
             S_PRED:                    state_d = S_WAIT;
@@ -600,7 +671,7 @@ module bp_hp_core #(
     /* verilator lint_off UNUSEDSIGNAL */
     logic unused_ok;
     assign unused_ok = ^{pred_req_pc_i, upd_pc_i[PC_W-1:6], upd_pc_i[4:3], upd_pc_i[1],
-                         upd_target_i, phist_q};
+                         upd_target_i, phist_q, y_q};
     /* verilator lint_on UNUSEDSIGNAL */
 
     // -------------------------------------------------------------------------
@@ -616,6 +687,8 @@ module bp_hp_core #(
         end
         if (rst_ni && pred_req_valid_i && !pred_req_ready_o)
             $error("bp_hp_core: predict request while a branch is in flight");
+        if (rst_ni && state_q == S_WAIT && bias_chg != (bias_new != bw_q))
+            $error("bp_hp_core: bias write enable differs from the step");
     end
 `endif
 

@@ -7,7 +7,10 @@
 //   prediction check, drain and report come from tb_bp_common.svh (golden
 //   dump of the patched CBP5 harness, +STIM=<path>). The banks are
 //   behavioral bp_sram models instantiated here, next to dut (instance name
-//   dut, the synthesized unit).
+//   dut, the synthesized unit). The predict / update tasks wait on the
+//   handshakes, so the DUT's prediction latency (1 + PRED_REG cycles) needs
+//   nothing here; PRED_REG's default equals bp_tage_core's, so an RTL run
+//   without overrides checks the configuration synthesis builds.
 //
 //   State trace (+STATE=<path> or STATE_FILE): the file tage_cb.h writes when
 //   run with TAGE_CB_STATE=<path>, one line per UpdatePredictor (kind 1) /
@@ -33,6 +36,7 @@
 // Parameters:
 //   NHIST, LOGT, LOGB, TBITS, CB_LMP, ILEN_CAP, T1_HIST..T14_HIST
 //                    - as bp_tage_core
+//   PRED_REG         - DUT prediction pipelining (RTL only; baked into a netlist)
 //   STIM_FILE        - default golden dump ("" = +STIM=<path> required)
 //   STATE_FILE       - default state trace ("" = +STATE=<path> or none)
 //   MAX_LINES        - stop after this many branch lines (0 = whole file)
@@ -76,6 +80,7 @@ module tb_bp_tage_core #(
     parameter int unsigned T12_HIST       = 104,
     parameter int unsigned T13_HIST       = 0,
     parameter int unsigned T14_HIST       = 0,
+    parameter bit          PRED_REG       = 1'b1,
     parameter string       STIM_FILE      = "",
     parameter string       STATE_FILE     = "",
     parameter int unsigned MAX_LINES      = 0,
@@ -151,6 +156,7 @@ module tb_bp_tage_core #(
         .T12_HIST         (T12_HIST),
         .T13_HIST         (T13_HIST),
         .T14_HIST         (T14_HIST),
+        .PRED_REG         (PRED_REG),
         .PC_W             (PC_W)
     ) dut (
 `endif
@@ -237,8 +243,8 @@ module tb_bp_tage_core #(
     // Hooks for tb_bp_common.svh
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("NHIST=%0d LOGT=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d banks=%0d x %0d rows x %0d bits",
-                         NHIST, LOGT, LOGB, TBITS, CB_LMP, NB, ROWS, ROW_W);
+        return $sformatf("NHIST=%0d LOGT=%0d LOGB=%0d TBITS=%0d CB_LMP=%0d PRED_REG=%0d banks=%0d x %0d rows x %0d bits",
+                         NHIST, LOGT, LOGB, TBITS, CB_LMP, PRED_REG, NB, ROWS, ROW_W);
     endfunction
 
     function automatic string tb_debug();

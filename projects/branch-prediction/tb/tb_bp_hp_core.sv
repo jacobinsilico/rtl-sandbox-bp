@@ -31,12 +31,23 @@
 //               (newest min(64, longest history) bits)
 //   With no state file only the predictions are checked.
 //
+//   The probes hold for every IDX_REG / DEC_CKPT / Y_REG combination: the
+//   indices (latched at the predict handshake), y_q and the weights
+//   (latched in S_RD) and the |y| <= theta flag (DEC_CKPT = 1: latched in
+//   S_RD; 0: from y_q) are all set before the update handshake, so
+//   dut.train is complete at the falling edge before it, and they still
+//   belong to the checked branch at the first falling edge after the
+//   update (the next predict handshake is a rising edge later).
+//
 //   Parameters must match the dump's hashed_perceptron build; T<i>_HIST are
 //   the PREDICTOR_HIST_LENS values of its CBP5 .log.
 //
 // Parameters:
 //   NUM_TABLES .. HP_PC_SHIFT - as bp_hp_core (must match the DUT and dump)
-//   Y_REG                     - DUT prediction timing (RTL only)
+//   IDX_REG, DEC_CKPT, Y_REG  - DUT pipelining knobs (RTL only; a netlist has
+//                               them baked in); the defaults equal
+//                               bp_hp_core's, so an RTL run without overrides
+//                               checks the configuration synthesis builds
 //   STIM_FILE                 - default golden dump ("" = +STIM=<path>)
 //   STATE_FILE                - default state trace ("" = +STATE=<path> or none)
 //   MAX_LINES                 - stop after this many branch lines (0 = all)
@@ -92,6 +103,8 @@ module tb_bp_hp_core #(
     parameter int unsigned HP_PATH_BITS     = 16,
     parameter int unsigned HP_PCMIX         = 1,
     parameter int unsigned HP_PC_SHIFT      = 2,
+    parameter bit          IDX_REG          = 1'b0,
+    parameter bit          DEC_CKPT         = 1'b1,
     parameter bit          Y_REG            = 1'b0,
     parameter string       STIM_FILE        = "",
     parameter string       STATE_FILE       = "",
@@ -214,6 +227,8 @@ module tb_bp_hp_core #(
         .HP_PATH_BITS      (HP_PATH_BITS),
         .HP_PCMIX          (HP_PCMIX),
         .HP_PC_SHIFT       (HP_PC_SHIFT),
+        .IDX_REG           (IDX_REG),
+        .DEC_CKPT          (DEC_CKPT),
         .Y_REG             (Y_REG),
         .PC_W              (PC_W)
     ) dut (
@@ -282,10 +297,11 @@ module tb_bp_hp_core #(
     // Bench-specific strings for the shared body
     // -------------------------------------------------------------------------
     function automatic string tb_params();
-        return $sformatf("NUM_TABLES=%0d logs=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d wbits=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d bias=%0dx%0d folds=%0d path=%0d pcmix=%0d Y_REG=%0d",
+        return $sformatf("NUM_TABLES=%0d logs=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d wbits=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d bias=%0dx%0d folds=%0d path=%0d pcmix=%0d IDX_REG=%0d DEC_CKPT=%0d Y_REG=%0d",
                          NUM_TABLES, T0_LOG, T1_LOG, T2_LOG, T3_LOG, T4_LOG, T5_LOG, T6_LOG, T7_LOG,
                          T0_WBITS, T1_WBITS, T2_WBITS, T3_WBITS, T4_WBITS, T5_WBITS, T6_WBITS, T7_WBITS,
-                         BIAS_ENTRIES, BIAS_WEIGHT_BITS, HP_FOLDS, HP_PATH_BITS, HP_PCMIX, Y_REG);
+                         BIAS_ENTRIES, BIAS_WEIGHT_BITS, HP_FOLDS, HP_PATH_BITS, HP_PCMIX,
+                         IDX_REG, DEC_CKPT, Y_REG);
     endfunction
 
     function automatic string tb_debug();
