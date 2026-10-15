@@ -10,22 +10,43 @@
 #     rtl  make sim on every trace's dump: RTL vs CBP5, bit-exact. When a
 #          <trace>.state file sits next to the dump (TAGE, hashed perceptron)
 #          it is passed as STATE_FILE and every branch's internal state is
-#          compared too.
+#          compared too (as far as the state file goes: a state trace capped
+#          at fewer passes than the dump ends the state checks, not the run).
+#          --rtl-passes N runs the first N passes of a multi-pass dump
+#          (branches_per_pass lines each, from the dump's .json); otherwise
+#          --rtl-lines (0 = the whole dump).
 #     syn  make syn of the core (the SRAMs stay outside, in the bench)
 #     sta  make post-syn-sta with IO_DELAY_PCT (default 0) and the extra
 #          reports of sta_reports.tcl (SDC hook): unclamped worst slack,
 #          critical delay = period - worst slack, prediction-path delay
-#     gls  make post-syn-sim VCD=1 on every trace, capped at --gls-lines
-#          branches: the netlist checked against the dump again, and its
-#          activity
+#     gls  make post-syn-sim VCD=1 on every trace: the netlist checked against
+#          the dump again, and its activity. Activity window:
+#            --gls-warmup-passes W (> 0): the first W passes warm the
+#              predictor up unrecorded; the VCD and the window counters
+#              (cycles, conditional branches, SRAM accesses) cover the first
+#              --gls-window-pct percent of pass W+1, then the core drains.
+#              The bench gets VCD_START = first line of the window and
+#              MAX_LINES = its last line.
+#            0 (default): the whole run, capped at --gls-lines branches.
 #     dpa  make post-syn-dpa on each trace's activity (power per trace)
 #
-#   Disk: the VCD is capped by --gls-lines and deleted once its DPA passed;
-#   the sim/ run directory of a passed rtl step, and of a gls step whose DPA
-#   passed, is deleted too (the step's make output stays in eval/). Failed
-#   runs keep everything for debugging. --keep-vcd / --keep-sim disable the
-#   cleanup. A gls step refuses to start below --min-free-gb free space. A
-#   DPA that has to run again after its VCD was deleted reruns the gls step.
+#   Energy per conditional branch is computed over the activity window, at
+#   the clock the gate-level run and its DPA ran at (recorded with them):
+#     E = P * TB_WIN_CYCLES * T_clk / TB_WIN_COND_BR
+#
+#   Disk: the VCD is deleted once its DPA passed; the sim/ run directory of a
+#   passed rtl step, and of a gls step whose DPA passed, is deleted too (the
+#   step's make output stays in eval/). Failed runs keep everything for
+#   debugging. --keep-vcd / --keep-sim disable the cleanup. A gls step
+#   refuses to start below --min-free-gb free space. A DPA that has to run
+#   again after its VCD was deleted reruns the gls step.
+#
+#   Dumps may be deleted after a budget is evaluated (dump_eval.py does):
+#   a dump directory that keeps its .json / .log files still counts. Its
+#   records stay in the CSV and synthesis / STA still run; rtl and gls steps
+#   report that the dump is gone instead of running (they never overwrite a
+#   finished record). Only budgets with dumps are run unless --budgets
+#   names them.
 #
 #   The PILOT budget (--pilot, default the smallest) runs first, all steps on
 #   all traces. If any of its steps fails, this predictor stops, so a broken
@@ -43,7 +64,7 @@
 #
 #   RTL parameters come from the dump's metadata, so every step is built with
 #   exactly the config that produced the dumps:
-#     gshare, g_perceptron  the .json (-D defines)
+#     gshare, g_perceptron  the .json (-D defines; INDEX_FOLD too when set)
 #     hashed_perceptron     the .log (PREDICTOR_CONFIG, PREDICTOR_HIST_LENS)
 #     tage_cb               the .log (PREDICTOR_CONFIG, PREDICTOR_KNOBS,
 #                           PREDICTOR_HIST_LENS); direct-mapped only
@@ -57,9 +78,9 @@
 #   a summary table on stdout
 #
 #   Per conditional branch, per trace (gate-level run, SRAMs excluded):
-#     E = P * TB_CYCLES * T_clk / TB_COND_BR, for the total power and split
-#     into sequential, combinational and leakage
-#     SRAM traffic: TB_SRAM_READS / TB_COND_BR, TB_SRAM_WRITES / TB_COND_BR
+#     E = P * TB_WIN_CYCLES * T_clk / TB_WIN_COND_BR, for the total power and
+#     split into sequential, combinational and leakage
+#     SRAM traffic: TB_WIN_SRAM_READS / TB_WIN_COND_BR, TB_WIN_SRAM_WRITES / ...
 #   The SRAM structures (PREDICTOR_STRUCT lines of the CBP5 log) are copied
 #   into the CSV for the SRAM costing step.
 #   campaign.py runs all four predictors through evaluate_predictor().
@@ -70,8 +91,11 @@
 #     --budgets 1KB 4KB  subset of budgets (default: all with dumps)
 #     --pilot 4KB        budget run first; stop if it fails (default: smallest)
 #     --steps rtl syn    subset of steps (default: rtl syn sta gls dpa)
-#     --rtl-lines N      branch lines per RTL check (default 0 = whole trace)
-#     --gls-lines N      branch lines per gate-level run = VCD cap (default 20000)
+#     --rtl-passes N     passes per RTL check (multi-pass dumps; 0 = use --rtl-lines)
+#     --rtl-lines N      branch lines per RTL check (default 0 = whole dump)
+#     --gls-warmup-passes W  activity window in pass W+1 (0 = from the start)
+#     --gls-window-pct P     window length, percent of a pass (default 1)
+#     --gls-lines N      branch lines per gate-level run without a window (20000)
 #     --clk NS           clock period (default 3.0)
 #     --io-delay-pct P   STA/DPA I/O delay, percent of the period (default 0)
 #     --extra K=V ...    extra RTL parameters, e.g. --extra Y_REG=1
@@ -85,8 +109,9 @@
 #
 #   Examples:
 #     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --print-params
-#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --steps rtl --rtl-lines 10000
-#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py hashed_perceptron --budgets 1KB
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --steps rtl --rtl-passes 1
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py hashed_perceptron --budgets 1KB \
+#         --clk 0.9 --gls-warmup-passes 5 --gls-window-pct 1
 #
 #   Adding a predictor: a params function and one entry in PREDICTORS.
 #   Report parsing is tolerant: a value that cannot be found is left empty
@@ -121,7 +146,8 @@ STEPS = ["rtl", "syn", "sta", "gls", "dpa"]
 # run with the same settings produce the same step keys, so they reuse each
 # other's records.
 DEFAULTS = {
-    "budgets": None, "pilot": None, "steps": STEPS, "rtl_lines": 0, "gls_lines": 20000,
+    "budgets": None, "pilot": None, "steps": STEPS, "rtl_lines": 0, "rtl_passes": 0,
+    "gls_lines": 20000, "gls_warmup_passes": 0, "gls_window_pct": 1.0,
     "clk": "3.0", "io_delay_pct": 0, "extra": [], "hier": False, "keep_vcd": False,
     "keep_sim": False, "min_free_gb": 5.0, "print_params": False, "rerun": False,
     "dry_run": False,
@@ -189,9 +215,12 @@ def params_g_perceptron(stem):
         raise ValueError(f"GHR_LEN {h} outside the RTL range 1..64")
     if n < 2:
         raise ValueError(f"NUM_PERCEPTRONS {n} not supported by the RTL")
-    return {"GHR_LEN": h, "NUM_PERCEPTRONS": n, "WEIGHT_BITS": need(d, "WEIGHT_BITS"),
-            "THETA_ALPHA_PCT": need(d, "THETA_ALPHA_PCT", 100),
-            "PC_SHIFT": need(d, "PC_SHIFT", 0)}
+    p = {"GHR_LEN": h, "NUM_PERCEPTRONS": n, "WEIGHT_BITS": need(d, "WEIGHT_BITS"),
+         "THETA_ALPHA_PCT": need(d, "THETA_ALPHA_PCT", 100),
+         "PC_SHIFT": need(d, "PC_SHIFT", 0)}
+    if "INDEX_FOLD" in d:                 # g_perceptron_rtl.h dumps
+        p["INDEX_FOLD"] = need(d, "INDEX_FOLD")
+    return p
 
 
 def params_hashed_perceptron(stem):
@@ -299,7 +328,9 @@ def warn_missing(step, metrics, keys, files):
 
 def tb_metrics(text):
     keys = ["TB_LINES", "TB_COND_BR", "TB_UNCOND_BR", "TB_RTL_MISPRED", "TB_REF_MISPRED",
-            "TB_CYCLES", "TB_SRAM_READS", "TB_SRAM_WRITES", "TB_STATE_LINES", "TB_STATE_CKSUMS"]
+            "TB_CYCLES", "TB_SRAM_READS", "TB_SRAM_WRITES", "TB_STATE_LINES", "TB_STATE_CKSUMS",
+            "TB_WIN_START", "TB_WIN_LINES", "TB_WIN_COND_BR", "TB_WIN_CYCLES",
+            "TB_WIN_SRAM_READS", "TB_WIN_SRAM_WRITES"]
     m = {k.lower()[3:]: first([rf"^{k}\s*:\s*(\d+)"], text, int) for k in keys}
     m["passed"] = "PASSED" in text
     return m
@@ -473,9 +504,20 @@ class Budget:
         self.kb = budget_kb(label)
         self.cid = os.path.basename(dump_dir).split("__", 1)[1]
         self.src = src_hash
-        dumps = sorted(glob.glob(os.path.join(dump_dir, "*.golden.txt")))
+        # A trace is known from its .json + .log pair (written with every valid
+        # dump and kept when dump_eval.py deletes the dump itself); any other
+        # .json in the directory (e.g. a dump_eval.py marker) is not a trace.
+        metas = dump_metas(dump_dir)
         # trace short name (fdd_su_v1_0) -> dump stem (path without .golden.txt)
-        self.traces = {os.path.basename(d).split(".")[0]: d[:-len(".golden.txt")] for d in dumps}
+        self.traces = {os.path.basename(m).split(".")[0]: m[:-len(".json")] for m in metas}
+        if not self.traces:
+            raise ValueError("no dump metadata (.json) in the directory")
+        self.meta = {}
+        for t, stem in self.traces.items():
+            try:
+                self.meta[t] = json.load(open(stem + ".json"))
+            except (OSError, ValueError):
+                self.meta[t] = {}
         stem0 = next(iter(self.traces.values()))
         self.core = spec["params"](stem0)
         for kv in args.extra:
@@ -487,6 +529,47 @@ class Budget:
             r"^PREDICTOR_STRUCT (\S+) ENTRIES (\d+) WIDTH (\d+)", cbp_log, re.MULTILINE))
         self.edir = os.path.join(EVAL_DIR, args.predictor, label)
         self.tag = f"{args.predictor}_{label}"
+
+    # ---- dumps and their line ranges ----
+    def has_dump(self, trace):
+        return os.path.exists(self.traces[trace] + ".golden.txt")
+
+    def has_dumps(self):
+        return any(self.has_dump(t) for t in self.traces)
+
+    def bpp(self, trace):
+        v = self.meta[trace].get("branches_per_pass")
+        if not v:
+            raise ValueError(f"{trace}: no branches_per_pass in the dump's .json "
+                             f"(a dump of 01_golden_dump.py --trace-kind long)")
+        return int(v)
+
+    def rtl_lines(self, trace):
+        """Branch lines of the RTL check (MAX_LINES; 0 = whole dump)."""
+        a = self.args
+        if a.rtl_passes:
+            n = a.rtl_passes * self.bpp(trace)
+            total = self.meta[trace].get("lines")
+            if total is not None and n > total:
+                raise ValueError(f"{trace}: --rtl-passes {a.rtl_passes} needs {n} lines, "
+                                 f"the dump has {total}")
+            return n
+        return a.rtl_lines
+
+    def gls_window(self, trace):
+        """-> (VCD_START, MAX_LINES) of the gate-level run: (0, --gls-lines)
+        without a window; else the first --gls-window-pct % of pass W+1."""
+        a = self.args
+        if not a.gls_warmup_passes:
+            return 0, a.gls_lines
+        bpp = self.bpp(trace)
+        start = a.gls_warmup_passes * bpp + 1
+        end = start - 1 + max(1, int(round(bpp * a.gls_window_pct / 100.0)))
+        total = self.meta[trace].get("lines")
+        if total is not None and end > total:
+            raise ValueError(f"{trace}: window ends at line {end}, the dump has {total} "
+                             f"(needs {a.gls_warmup_passes + 1} passes)")
+        return start, end
 
     # ---- run directories ----
     def sim_dir(self, kind, trace):
@@ -507,7 +590,10 @@ class Budget:
 
     def done(self, step, key=None):
         rec = self.load(step)
-        key = self.key(step) if key is None else key
+        try:
+            key = self.key(step) if key is None else key
+        except ValueError:
+            return False
         return rec is not None and rec.get("status") == "ok" and rec.get("key") == key \
             and not self.args.rerun
 
@@ -525,7 +611,7 @@ class Budget:
             stem = self.traces[step[4:]]
             state = stem + ".state" if self.spec["state"] and os.path.exists(stem + ".state") else ""
             return (f"{self.top}|{p}|src {self.src}|dump {file_sig(stem + '.golden.txt')}|"
-                    f"{a.rtl_lines}|{a.clk}|{state} {file_sig(state) if state else ''}")
+                    f"{self.rtl_lines(step[4:])}|{a.clk}|{state} {file_sig(state) if state else ''}")
         if step in ("syn", "syn_hier"):
             return f"{self.top}|{p}|src {self.src}|{a.clk}|{step == 'syn_hier'}"
         syn_key = (self.load("syn") or {}).get("key")
@@ -534,18 +620,27 @@ class Budget:
             return f"{syn_key}|{a.clk}|io {a.io_delay_pct}|sdc {sdc}"
         if step.startswith("gls_"):
             stem = self.traces[step[4:]]
-            return f"{syn_key}|{stem}|dump {file_sig(stem + '.golden.txt')}|{a.gls_lines}"
+            start, end = self.gls_window(step[4:])
+            return f"{syn_key}|{stem}|dump {file_sig(stem + '.golden.txt')}|{start}-{end}"
         if step.startswith("dpa_"):
             return f"{(self.load('gls_' + step[4:]) or {}).get('key')}|io {a.io_delay_pct}"
         raise KeyError(step)
 
     def run_step(self, step, force=False):
         """Runs one step unless finished; returns a status string."""
-        key = self.key(step)
-        if not force and self.done(step, key):
-            return "ok (kept)"
         t0, a, kind = time.time(), self.args, step.split("_")[0]
         trace = step.split("_", 1)[1] if step.startswith(("rtl_", "gls_", "dpa_")) else None
+        if kind in ("rtl", "gls") and not self.has_dump(trace):
+            # never overwrite a finished record because its dump was deleted
+            rec = self.load(step) or {}
+            return ("FAILED (dump deleted; regenerate it with dump_eval.py)"
+                    + (" -- the earlier record stays" if rec.get("status") == "ok" else ""))
+        try:
+            key = self.key(step)
+        except ValueError as exc:
+            return f"FAILED ({exc})"      # a wrong option: no record is overwritten
+        if not force and self.done(step, key):
+            return "ok (kept)"
         logf = os.path.join(self.edir, f"{step}.log")
         if not a.dry_run:
             os.makedirs(self.edir, exist_ok=True)
@@ -554,12 +649,13 @@ class Budget:
 
         if kind == "rtl":
             stem = self.traces[trace]
-            par = f"{p} MAX_LINES={a.rtl_lines} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            par = f"{p} MAX_LINES={self.rtl_lines(trace)} {quoted('STIM_FILE', stem + '.golden.txt')}"
             if self.spec["state"] and os.path.exists(stem + ".state"):
                 par += " " + quoted("STATE_FILE", stem + ".state")
             rc, text = make(a, "sim", base + [("OUT_DIR", f"sim_{self.tag}_{trace}"),
                                               ("PARAMS", par)], logf)
             m = tb_metrics(text)
+            m["max_lines"] = self.rtl_lines(trace)
             ok = rc == 0 and m["passed"]
             if ok and not a.keep_sim and not a.dry_run:
                 remove_tree(self.sim_dir("sim", trace))
@@ -572,6 +668,7 @@ class Budget:
             ok = rc == 0
             m = ((parse_area_hier(out) if step == "syn_hier" else parse_area(out, self.top))
                  if ok and not a.dry_run else {})
+            m["clk_ns"] = a.clk
         elif kind == "sta":
             var = base + [("OUT_DIR", f"sta_{self.tag}"), ("NETLIST_DIR", f"syn_{self.tag}"),
                           ("IO_DELAY_PCT", a.io_delay_pct)]
@@ -580,6 +677,7 @@ class Budget:
             rc, _ = make(a, "post-syn-sta", var, logf)
             ok = rc == 0
             m = parse_sta(f"sta_{self.tag}", a.clk) if ok and not a.dry_run else {}
+            m["clk_ns"] = a.clk
         elif kind == "gls":
             if not a.dry_run and free_gb(PROJ_DIR) < a.min_free_gb:
                 msg = (f"only {free_gb(PROJ_DIR):.1f} GB free (< --min-free-gb {a.min_free_gb}); "
@@ -587,22 +685,30 @@ class Budget:
                 self.save(step, key, False, {"error": msg}, t0)
                 return f"FAILED ({msg})"
             stem = self.traces[trace]
+            start, end = self.gls_window(trace)
             if not a.dry_run:
                 remove_tree(self.sim_dir("gls", trace))     # no stale VCD from an older run
-            par = f"{p} MAX_LINES={a.gls_lines} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            par = f"{p} MAX_LINES={end} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            if start:
+                par += f" VCD_START={start}"
             rc, text = make(a, "post-syn-sim", base + [
                 ("OUT_DIR", f"gls_{self.tag}_{trace}"), ("NETLIST_DIR", f"syn_{self.tag}"),
                 ("VCD", 1), ("PARAMS", par)], logf)
             m = tb_metrics(text)
+            m.update(clk_ns=a.clk, vcd_start=start, max_lines=end)
             m["vcd_mb"] = round(sum(os.path.getsize(v) for v in self.vcds(trace)) / 1e6, 1) \
                 if not a.dry_run else None
             ok = rc == 0 and m["passed"]
+            if ok and start and m.get("win_start") not in (None, start):
+                ok = False
+                m["error"] = f"bench window starts at line {m.get('win_start')}, expected {start}"
         else:  # dpa
             var = base + [("OUT_DIR", f"dpa_{self.tag}_{trace}"), ("NETLIST_DIR", f"syn_{self.tag}"),
                           ("VCD_DIR", f"gls_{self.tag}_{trace}"), ("IO_DELAY_PCT", a.io_delay_pct)]
             rc, _ = make(a, "post-syn-dpa", var, logf)
             ok = rc == 0
             m = parse_power(f"dpa_{self.tag}_{trace}") if ok and not a.dry_run else {}
+            m["clk_ns"] = a.clk
             if ok and not a.dry_run and not a.keep_vcd:
                 if a.keep_sim:
                     for v in self.vcds(trace):
@@ -615,9 +721,12 @@ class Budget:
         self.save(step, key, ok, m, t0)
         if kind in ("rtl", "gls"):
             extra = f"  state lines={m.get('state_lines')}" if m.get("state_lines") else ""
+            extra += (f"  window lines {m.get('win_start')}+{m.get('win_lines')}"
+                      if kind == "gls" and m.get("vcd_start") else "")
             extra += f"  vcd {m['vcd_mb']} MB" if m.get("vcd_mb") else ""
-            return (f"{'ok' if ok else 'FAILED'}  cond={m.get('cond_br')} mispred={m.get('rtl_mispred')}"
-                    f"{extra}" + ("" if ok else f"  (see {logf})"))
+            extra += f"  {m['error']}" if m.get("error") else ""
+            return (f"{'ok' if ok else 'FAILED'}  lines={m.get('lines')} cond={m.get('cond_br')} "
+                    f"mispred={m.get('rtl_mispred')}{extra}" + ("" if ok else f"  (see {logf})"))
         return "ok" if ok else f"FAILED (exit {rc}, see {logf})"
 
     def run(self):
@@ -661,9 +770,10 @@ class Budget:
             rtl, gls, dpa = met(f"rtl_{trace}"), met(f"gls_{trace}"), met(f"dpa_{trace}")
             r = {"predictor": self.args.predictor, "budget": self.label, "budget_kb": self.kb,
                  "trace": trace, "config_id": self.cid, "rtl_params": params_str(self.core),
-                 "size_bits": self.size_bits, "sram_structs": self.structs, "clk_ns": self.args.clk,
+                 "size_bits": self.size_bits, "sram_structs": self.structs,
+                 "clk_ns": sta.get("clk_ns", self.args.clk),
                  "io_delay_pct": self.args.io_delay_pct,
-                 "rtl_pass": rtl.get("passed", ""), "rtl_lines": self.args.rtl_lines,
+                 "rtl_pass": rtl.get("passed", ""), "rtl_lines": rtl.get("lines", ""),
                  "rtl_state_lines": rtl.get("state_lines", "")}
             cond = rtl.get("cond_br")
             r["mpkbr"] = round(1000.0 * rtl["rtl_mispred"] / cond, 4) if cond else ""
@@ -673,18 +783,27 @@ class Budget:
                       "crit_start", "crit_end"):
                 r[k] = sta.get(k, "")
             r["gls_pass"] = gls.get("passed", "")
+            r["gls_clk_ns"] = gls.get("clk_ns", "")
+            r["gls_win_start"] = gls.get("win_start", "")
+            r["gls_win_lines"] = gls.get("win_lines", "")
             for k in ("cond_br", "cycles", "sram_reads", "sram_writes"):
                 r[f"gls_{k}"] = gls.get(k, "")
             for k in ("p_total_w", "p_sequential_w", "p_combinational_w", "p_clock_w",
                       "p_internal_w", "p_switching_w", "p_leakage_w",
                       "vcd_annotated", "vcd_unannotated"):
                 r[k] = dpa.get(k, "")
-            gc, cyc = gls.get("cond_br"), gls.get("cycles")
+            # the activity window (the whole run for benches without one)
+            gc = gls.get("win_cond_br") or gls.get("cond_br")
+            cyc = gls.get("win_cycles") or gls.get("cycles")
+            rd = gls.get("win_sram_reads") if gls.get("win_cond_br") else gls.get("sram_reads")
+            wr = gls.get("win_sram_writes") if gls.get("win_cond_br") else gls.get("sram_writes")
             if gc and cyc:
                 r["cycles_per_cond"] = round(cyc / gc, 4)
-                r["sram_rd_per_cond"] = round(gls["sram_reads"] / gc, 4)
-                r["sram_wr_per_cond"] = round(gls["sram_writes"] / gc, 4)
-                t_per_cond = cyc * float(self.args.clk) * 1e-9 / gc       # s per branch
+                r["sram_rd_per_cond"] = round((rd or 0) / gc, 4)
+                r["sram_wr_per_cond"] = round((wr or 0) / gc, 4)
+                # power was measured at the clock of the gls / dpa run, not --clk
+                clk = float(dpa.get("clk_ns") or gls.get("clk_ns") or self.args.clk)
+                t_per_cond = cyc * clk * 1e-9 / gc                     # s per branch
                 for src, dst in (("p_total_w", "e_logic_pj_per_cond"),
                                  ("p_sequential_w", "e_seq_pj_per_cond"),
                                  ("p_combinational_w", "e_comb_pj_per_cond"),
@@ -708,8 +827,16 @@ def make_opts(**kw):
     return argparse.Namespace(**dict(DEFAULTS, **kw))
 
 
+def dump_metas(dump_dir):
+    """The .json files of a dump directory that belong to a trace dump: those
+    with a matching .log (01_golden_dump.py writes both)."""
+    return sorted(m for m in glob.glob(os.path.join(dump_dir, "*.json"))
+                  if os.path.exists(m[:-len(".json")] + ".log"))
+
+
 def load_budgets(predictor, opts):
-    """Budget objects of every usable dump directory; exits on duplicates."""
+    """Budget objects of every dump directory (with or without its dump
+    files); exits on duplicates."""
     spec = PREDICTORS[predictor]
     stim = os.path.join(PROJ_DIR, "stim", predictor)
     dirs = sorted(glob.glob(os.path.join(stim, "*__*")),
@@ -718,7 +845,7 @@ def load_budgets(predictor, opts):
     budgets = []
     for d in dirs:
         label = os.path.basename(d).split("__", 1)[0]
-        if not glob.glob(os.path.join(d, "*.golden.txt")):
+        if not dump_metas(d):
             continue
         try:
             budgets.append(Budget(opts, spec, label, d, src))
@@ -742,10 +869,12 @@ def evaluate_predictor(predictor, opts):
         return False, []
     if opts.print_params:
         for b in budgets:
-            log(f"{b.label:>5s} {b.top} traces={','.join(b.traces)}\n      {params_str(b.core)}")
+            log(f"{b.label:>5s} {b.top} traces={','.join(b.traces)}"
+                f"{'' if b.has_dumps() else '  (dumps deleted)'}\n      {params_str(b.core)}")
         return True, []
 
-    todo = [b for b in budgets if not opts.budgets or b.label in opts.budgets]
+    # without --budgets: only budgets that still have their dumps
+    todo = [b for b in budgets if (b.label in opts.budgets if opts.budgets else b.has_dumps())]
     missing = sorted(set(opts.budgets or []) - {b.label for b in todo}, key=budget_key)
     if missing:
         log(f"WARNING {predictor}: no usable dumps for {' '.join(missing)} "
@@ -755,13 +884,16 @@ def evaluate_predictor(predictor, opts):
     pilot = opts.pilot if opts.pilot in [b.label for b in todo] else todo[0].label
     todo.sort(key=lambda b: (b.label != pilot, budget_key(b.label)))
 
+    window = (f"gls window: {opts.gls_window_pct}% of pass {opts.gls_warmup_passes + 1}"
+              if opts.gls_warmup_passes else f"gls lines {opts.gls_lines}")
+    rtl_n = f"rtl passes {opts.rtl_passes}" if opts.rtl_passes else f"rtl lines {opts.rtl_lines or 'all'}"
     log(f"project {PROJECT}, predictor {predictor} ({spec['top']}), clk {opts.clk} ns, "
         f"steps {' '.join(opts.steps)}{' + syn_hier' if opts.hier else ''}, pilot {pilot}, "
-        f"gls lines {opts.gls_lines}")
+        f"{rtl_n}, {window}")
     all_ok = not missing
     for b in todo:
-        log(f"\n=== {predictor} {b.label}{' (pilot)' if b.label == pilot else ''}  {b.cid}\n"
-            f"    params {params_str(b.core)}")
+        log(f"\n=== {predictor} {b.label}{' (pilot)' if b.label == pilot else ''}  {b.cid}"
+            f"{'' if b.has_dumps() else '  (dumps deleted)'}\n    params {params_str(b.core)}")
         ok = b.run()
         all_ok &= ok
         if b.label == pilot and not ok and not opts.dry_run:
@@ -816,9 +948,16 @@ def add_common_args(ap):
     d = DEFAULTS
     ap.add_argument("--steps", nargs="+", default=d["steps"], choices=STEPS)
     ap.add_argument("--rtl-lines", type=int, default=d["rtl_lines"],
-                    help="branch lines per RTL check (0 = whole trace)")
+                    help="branch lines per RTL check (0 = whole dump)")
+    ap.add_argument("--rtl-passes", type=int, default=d["rtl_passes"],
+                    help="passes per RTL check of a multi-pass dump (0 = use --rtl-lines)")
     ap.add_argument("--gls-lines", type=int, default=d["gls_lines"],
-                    help="branch lines per gate-level run: the VCD cap")
+                    help="branch lines per gate-level run without a window: the VCD cap")
+    ap.add_argument("--gls-warmup-passes", type=int, default=d["gls_warmup_passes"],
+                    help="gate-level activity window in pass W+1 after W warm-up passes "
+                         "(0 = no window: from the start, --gls-lines)")
+    ap.add_argument("--gls-window-pct", type=float, default=d["gls_window_pct"],
+                    help="window length in percent of a pass (default 1)")
     ap.add_argument("--clk", default=d["clk"], help="clock period in ns")
     ap.add_argument("--io-delay-pct", type=int, default=d["io_delay_pct"])
     ap.add_argument("--extra", nargs="+", default=d["extra"], metavar="K=V")
@@ -835,7 +974,11 @@ def check_common_args(ap, args):
         float(args.clk)
     except ValueError:
         ap.error(f"--clk must be a number of nanoseconds, got '{args.clk}'")
-    if args.gls_lines <= 0 and "gls" in args.steps:
+    if args.gls_warmup_passes < 0 or args.rtl_passes < 0:
+        ap.error("--gls-warmup-passes and --rtl-passes must be >= 0")
+    if not 0 < args.gls_window_pct <= 100:
+        ap.error("--gls-window-pct must be in (0, 100]")
+    if not args.gls_warmup_passes and args.gls_lines <= 0 and "gls" in args.steps:
         ap.error("--gls-lines must be > 0: an uncapped gate-level VCD can fill the disk")
 
 

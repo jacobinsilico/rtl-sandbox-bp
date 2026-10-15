@@ -90,7 +90,7 @@ module tb_bp_tage_core #(
     parameter string       STATE_FILE     = "",
     parameter int unsigned MAX_LINES      = 0,
     parameter int unsigned VCD_START      = 0,
-    parameter int unsigned TIMEOUT_CYCLES = 4096
+    parameter int unsigned TIMEOUT_CYCLES = (1 << LOGT) + 256
 );
 
     localparam int unsigned PC_W     = 64;
