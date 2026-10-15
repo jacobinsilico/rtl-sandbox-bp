@@ -1,6 +1,17 @@
 # -----------------------------------------------------------------------------
 # Author: Simone Machetti
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by Jakub Dawid Szkudlarek:
+#   - arithmetic goes through alumacc and is mapped with a parallel-prefix
+#     (Kogge-Stone) carry network instead of techmap's ripple carry
+#     (scripts/syn/lcu_kogge_stone.v if present, else Yosys's
+#     +/choices/kogge-stone.v); SYN_RIPPLE_ADDERS=1 restores the original
+#     mapping (comparison runs)
+#   - SYN_ABC=<name> runs scripts/syn/abc_<name>.tcl instead of abc.tcl
+#     (abc_speed.tcl, abc_dch.tcl: delay-oriented variants); unset or
+#     "default" = abc.tcl. evaluate.py does not see environment variables in
+#     its step keys: run it with --rerun after changing SYN_ABC.
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -94,7 +105,27 @@ yosys "fsm"
 yosys "opt"
 yosys "memory"
 yosys "opt"
-yosys "techmap"
+
+# -----------------------------------------------------------------------------
+# Arithmetic. Default: $add / $sub / $lt / ... become $alu / $macc cells
+# (alumacc, as in Yosys's own synth script), and every $alu carry ($lcu) is
+# mapped to a Kogge-Stone parallel-prefix network (log depth,
+# scripts/syn/lcu_kogge_stone.v, no dependency on the Yosys install) instead
+# of the ripple carry of the generic techmap. SYN_RIPPLE_ADDERS=1 keeps the
+# original mapping.
+# -----------------------------------------------------------------------------
+if {[info exists env(SYN_RIPPLE_ADDERS)] && $env(SYN_RIPPLE_ADDERS) ne "0"} {
+    yosys "log ADDERS: ripple carry (SYN_RIPPLE_ADDERS=$env(SYN_RIPPLE_ADDERS))"
+    yosys "techmap"
+} else {
+    yosys "log ADDERS: Kogge-Stone parallel-prefix carry"
+    yosys "alumacc"
+    yosys "opt"
+    set ks_local "$env(REPO_HOME)/scripts/syn/lcu_kogge_stone.v"
+    set ks_map [expr {[file exists $ks_local] ? $ks_local : "+/choices/kogge-stone.v"}]
+    yosys "log ADDERS: carry map $ks_map"
+    yosys "techmap -map +/techmap.v -map $ks_map"
+}
 yosys "opt"
 
 # -----------------------------------------------------------------------------
@@ -110,11 +141,22 @@ yosys "techmap -map $env(ASAP7_HOME)/yoSys/cells_latch_R.v"
 yosys "opt"
 
 # -----------------------------------------------------------------------------
-# Technology mapping Combinational Logic (delay target from CLK_PERIOD_NS)
+# Technology mapping Combinational Logic (delay target from CLK_PERIOD_NS;
+# script abc.tcl, or abc_<SYN_ABC>.tcl)
 # -----------------------------------------------------------------------------
 set CLK_PERIOD_PS [expr {int($env(SEL_CLK_PERIOD_NS) * 1000)}]
 
-set fh [open $env(REPO_HOME)/scripts/syn/abc.tcl r]
+set abc_name "abc"
+if {[info exists env(SYN_ABC)] && $env(SYN_ABC) ne "" && $env(SYN_ABC) ne "default"} {
+    set abc_name "abc_$env(SYN_ABC)"
+}
+set abc_src "$env(REPO_HOME)/scripts/syn/${abc_name}.tcl"
+if {![file exists $abc_src]} {
+    error "SYN_ABC=$env(SYN_ABC): no $abc_src"
+}
+yosys "log ABC: script $abc_src"
+
+set fh [open $abc_src r]
 set abc_script [read $fh]
 close $fh
 set abc_script [string map [list "\{D\}" "-D $CLK_PERIOD_PS"] $abc_script]
