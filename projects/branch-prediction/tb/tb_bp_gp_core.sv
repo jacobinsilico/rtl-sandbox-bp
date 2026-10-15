@@ -64,6 +64,7 @@ module tb_bp_gp_core #(
     parameter bit          Y_REG           = 1'b0,
     parameter bit          DEC_CKPT        = 1'b1,
     parameter string       STIM_FILE       = "",
+    parameter int unsigned VCD_START      = 0,
     parameter int unsigned MAX_LINES       = 0,
     parameter int unsigned TIMEOUT_CYCLES  = 100
 );

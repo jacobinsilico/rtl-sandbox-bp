@@ -29,7 +29,10 @@
 //     RTL only  train (dut.train at the update handshake), pred, sum, bias /
 //               table indices, theta, tc, path history, global history
 //               (newest min(64, longest history) bits)
-//   With no state file only the predictions are checked.
+//   With no state file only the predictions are checked. A state trace
+//   shorter than the dump (capped at fewer passes, to save disk) ends the
+//   state checks where it ends; the predictions are still checked to the
+//   end of the dump. TB_STATE_LINES says how far the state was checked.
 //
 //   The probes hold for every IDX_REG / DEC_CKPT / Y_REG combination: the
 //   indices (latched at the predict handshake), y_q and the weights
@@ -51,6 +54,8 @@
 //   STIM_FILE                 - default golden dump ("" = +STIM=<path>)
 //   STATE_FILE                - default state trace ("" = +STATE=<path> or none)
 //   MAX_LINES                 - stop after this many branch lines (0 = all)
+//   VCD_START                 - first branch line of the activity window (0 =
+//                               from reset; see tb_bp_common.svh)
 //   TIMEOUT_CYCLES            - max cycles to wait for a ready or valid
 // -----------------------------------------------------------------------------
 
@@ -109,6 +114,7 @@ module tb_bp_hp_core #(
     parameter string       STIM_FILE        = "",
     parameter string       STATE_FILE       = "",
     parameter int unsigned MAX_LINES        = 0,
+    parameter int unsigned VCD_START        = 0,
     parameter int unsigned TIMEOUT_CYCLES   = 100
 );
 
@@ -351,6 +357,7 @@ module tb_bp_hp_core #(
     // Per-branch state check against the hashed_perceptron.h state trace
     // -------------------------------------------------------------------------
     int              st_fd     = 0;
+    logic            st_used   = 1'b0;   // a state trace was given
     longint unsigned st_lines  = 0;
     longint unsigned st_cksums = 0;
     logic            pend_cond = 1'b0;   // conditional update in progress
@@ -374,7 +381,15 @@ module tb_bp_hp_core #(
 
         line = "";
         do begin
-            if ($fgets(line, st_fd) == 0) fail("state trace ended before the golden dump");
+            if ($fgets(line, st_fd) == 0) begin
+                // a state trace capped at fewer passes than the dump: the
+                // state checks end here, the prediction checks go on
+                $display("State trace ends after %0d lines: state checks stop, predictions are still checked\n",
+                         st_lines);
+                $fclose(st_fd);
+                st_fd = 0;
+                return;
+            end
         end while (line.len() < 2 || line.getc(0) == "#");
 
         nf = $sscanf(line, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %h %h %d %h",
@@ -421,6 +436,7 @@ module tb_bp_hp_core #(
         if (st_path != "") begin
             st_fd = $fopen(st_path, "r");
             if (st_fd == 0) fail($sformatf("cannot open state trace '%s'", st_path));
+            st_used = 1'b1;
             $display("State trace: %s\n", st_path);
         end
     end
@@ -453,7 +469,7 @@ module tb_bp_hp_core #(
     end
 
     final begin
-        if (st_fd != 0) begin
+        if (st_used) begin
             $display("TB_STATE_LINES        : %0d", st_lines);
             $display("TB_STATE_CKSUMS       : %0d", st_cksums);
         end

@@ -28,7 +28,10 @@
 //                 TICK, CountMiss11, CountLowConf, use_alt_on_na, COUNT50,
 //                 COUNT16_31, phist, ptghist, Numero, PCBLOCK
 //   TB_STATE_LINES / TB_STATE_CKSUMS are printed at the end. With no state
-//   file only the predictions are checked.
+//   file only the predictions are checked. A state trace shorter than the
+//   dump (capped at fewer passes, to save disk) ends the state checks where
+//   it ends; the predictions are still checked to the end of the dump.
+//   TB_STATE_LINES says how far the state was checked.
 //
 //   Parameters must match the dump's tage_cb build (LOGASSOC=0); T<i>_HIST
 //   are the PREDICTOR_HIST_LENS values of its CBP5 .log.
@@ -40,6 +43,8 @@
 //   STIM_FILE        - default golden dump ("" = +STIM=<path> required)
 //   STATE_FILE       - default state trace ("" = +STATE=<path> or none)
 //   MAX_LINES        - stop after this many branch lines (0 = whole file)
+//   VCD_START        - first branch line of the activity window (0 = from
+//                      reset; see tb_bp_common.svh)
 //   TIMEOUT_CYCLES   - max cycles to wait for a ready or valid (a u-reset
 //                      sweep alone takes 2^LOGT + 1 cycles)
 // -----------------------------------------------------------------------------
@@ -84,6 +89,7 @@ module tb_bp_tage_core #(
     parameter string       STIM_FILE      = "",
     parameter string       STATE_FILE     = "",
     parameter int unsigned MAX_LINES      = 0,
+    parameter int unsigned VCD_START      = 0,
     parameter int unsigned TIMEOUT_CYCLES = 4096
 );
 
@@ -318,6 +324,7 @@ module tb_bp_tage_core #(
     // Per-branch state check against the tage_cb.h state trace
     // -------------------------------------------------------------------------
     int              st_fd     = 0;
+    logic            st_used   = 1'b0;   // a state trace was given
     longint unsigned st_lines  = 0;
     longint unsigned st_cksums = 0;
     int unsigned     rng_cnt   = 0;
@@ -343,7 +350,15 @@ module tb_bp_tage_core #(
 
         line = "";
         do begin
-            if ($fgets(line, st_fd) == 0) fail("state trace ended before the golden dump");
+            if ($fgets(line, st_fd) == 0) begin
+                // a state trace capped at fewer passes than the dump: the
+                // state checks end here, the prediction checks go on
+                $display("State trace ends after %0d lines: state checks stop, predictions are still checked\n",
+                         st_lines);
+                $fclose(st_fd);
+                st_fd = 0;
+                return;
+            end
         end while (line.len() < 2 || line.getc(0) == "#");
 
         nf = $sscanf(line, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %h %d %d %d %d %h %h %h %h %d %h %d %h",
@@ -400,6 +415,7 @@ module tb_bp_tage_core #(
         if (st_path != "") begin
             st_fd = $fopen(st_path, "r");
             if (st_fd == 0) fail($sformatf("cannot open state trace '%s'", st_path));
+            st_used = 1'b1;
             $display("State trace: %s\n", st_path);
         end
     end
@@ -424,7 +440,7 @@ module tb_bp_tage_core #(
     end
 
     final begin
-        if (st_fd != 0) begin
+        if (st_used) begin
             $display("TB_STATE_LINES        : %0d", st_lines);
             $display("TB_STATE_CKSUMS       : %0d", st_cksums);
         end

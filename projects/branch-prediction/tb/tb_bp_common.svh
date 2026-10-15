@@ -14,21 +14,35 @@
 //     is_cond pc taken target ref_pred        (pc and target in hex)
 //   Lines starting with '#' are skipped. Conditional branch: predict, check
 //   the prediction against ref_pred (fatal on the first mismatch), update.
-//   Unconditional branch: TrackOtherInst update only.
+//   Unconditional branch: TrackOtherInst update only. A multi-pass dump is
+//   read straight through: every pass has its own reference predictions.
 //
 //   Inputs are driven T_SETTLE after a rising edge and outputs are sampled
 //   T_SETTLE after a rising edge, so the DUT always samples stable values.
 //   After the last line the bench drains (waits until the core is idle), so
 //   the write-back of the last branch is simulated and counted.
 //
+//   Activity window: VCD_START = 0 records from reset to the end; VCD_START =
+//   n > 0 starts the window right before branch line n (counting branch
+//   lines only, as MAX_LINES does): with VCD the dump starts there
+//   ($dumpvars), and the window counters (lines, conditional branches,
+//   cycles, SRAM reads / writes) count from there to the end of the drain.
+//   Everything before it (warm-up) is simulated and checked but not
+//   recorded. The power of the VCD and the window counters describe the
+//   same interval, so energy per branch = P * cycles * T / conditional
+//   branches of the window.
+//
 //   Report (KEY : value lines, then PASSED or a fatal error):
 //     TB_LINES, TB_COND_BR, TB_UNCOND_BR, TB_RTL_MISPRED (must equal
 //     TB_REF_MISPRED), TB_RTL_MPKBr, TB_CYCLES, TB_SRAM_READS, TB_SRAM_WRITES
 //     (summed over all SRAMs; the SRAMs are outside dut, so the power
-//     analysis does not see them -- these counts feed the SRAM energy).
+//     analysis does not see them -- these counts feed the SRAM energy), and
+//     for the activity window TB_WIN_START (its first branch line),
+//     TB_WIN_LINES, TB_WIN_COND_BR, TB_WIN_CYCLES, TB_WIN_SRAM_READS,
+//     TB_WIN_SRAM_WRITES.
 //
 //   The including module must declare, BEFORE this include:
-//     parameters  STIM_FILE (string), MAX_LINES, TIMEOUT_CYCLES
+//     parameters  STIM_FILE (string), MAX_LINES, VCD_START, TIMEOUT_CYCLES
 //     localparam  PC_W, DUT_NAME (string)
 //     logic       clk_i, rst_ni
 //     logic       pred_req_valid, pred_req_ready, pred_resp_valid,
@@ -47,12 +61,17 @@
     localparam real T_SETTLE   = CLK_PERIOD / 10.0;
 
     // -------------------------------------------------------------------------
-    // Clock and activity counters. counting is set when reset is released.
+    // Clock and activity counters. counting is set when reset is released;
+    // in_win when the activity window opens (at reset with VCD_START = 0).
     // -------------------------------------------------------------------------
     logic            counting  = 1'b0;
+    logic            in_win    = 1'b0;
     longint unsigned n_cycles  = 0;
     longint unsigned n_sram_rd = 0;
     longint unsigned n_sram_wr = 0;
+    longint unsigned w_cycles  = 0;
+    longint unsigned w_sram_rd = 0;
+    longint unsigned w_sram_wr = 0;
 
     initial clk_i = 1'b0;
     always #(CLK_HALF) clk_i = ~clk_i;
@@ -62,6 +81,11 @@
             n_cycles  <= n_cycles  + 64'd1;
             n_sram_rd <= n_sram_rd + 64'(sram_rd_now);
             n_sram_wr <= n_sram_wr + 64'(sram_wr_now);
+            if (in_win) begin
+                w_cycles  <= w_cycles  + 64'd1;
+                w_sram_rd <= w_sram_rd + 64'(sram_rd_now);
+                w_sram_wr <= w_sram_wr + 64'(sram_wr_now);
+            end
         end
     end
 
@@ -79,6 +103,17 @@
 `endif
         $error("%s", msg);
         $fatal;
+    endtask
+
+    // Opens the activity window: from here on the VCD records and the
+    // window counters count.
+    task automatic open_window(input longint unsigned at_line);
+        in_win = 1'b1;
+`ifdef VCD
+        $dumpvars(0, dut);
+`endif
+        if (at_line > 1)
+            $display("Activity window opens before branch line %0d (VCD_START)\n", at_line);
     endtask
 
     task automatic predict(input logic [PC_W-1:0] pc, output logic taken);
@@ -149,18 +184,21 @@
         longint unsigned n_uncond;
         longint unsigned n_mis_rtl;
         longint unsigned n_mis_ref;
+        longint unsigned w_lines;
+        longint unsigned w_cond;
 
         stim = STIM_FILE;
         void'($value$plusargs("STIM=%s", stim));
         if (stim == "") fail("no stimulus file: pass +STIM=<path> or set STIM_FILE");
         fd = $fopen(stim, "r");
         if (fd == 0) fail($sformatf("cannot open stimulus file '%s'", stim));
+        if (MAX_LINES != 0 && VCD_START > MAX_LINES)
+            fail($sformatf("VCD_START %0d is beyond MAX_LINES %0d", VCD_START, MAX_LINES));
 
         $display("\nStarting %s verification (%s)", DUT_NAME, tb_params());
         $display("Stimulus: %s\n", stim);
 `ifdef VCD
         $dumpfile("activity.vcd");
-        $dumpvars(0, dut);
 `endif
 
         rst_ni         = 1'b0;
@@ -176,7 +214,10 @@
         n_uncond       = 0;
         n_mis_rtl      = 0;
         n_mis_ref      = 0;
+        w_lines        = 0;
+        w_cond         = 0;
         lineno         = 0;
+        if (VCD_START == 0) open_window(0);   // from time 0, as before
         repeat (3) @(posedge clk_i);
         #(T_SETTLE);
         rst_ni   = 1'b1;
@@ -190,6 +231,11 @@
             if (nfields != 5)
                 fail($sformatf("%s:%0d: expected 5 fields, got %0d", stim, lineno, nfields));
             n_lines++;
+            if (!in_win && n_lines == 64'(VCD_START)) open_window(n_lines);
+            if (in_win) begin
+                w_lines++;
+                if (f_is_cond != 0) w_cond++;
+            end
 
             if (f_is_cond != 0) begin
                 n_cond++;
@@ -227,8 +273,17 @@
         $display("TB_CYCLES             : %0d", n_cycles);
         $display("TB_SRAM_READS         : %0d", n_sram_rd);
         $display("TB_SRAM_WRITES        : %0d", n_sram_wr);
+        $display("TB_WIN_START          : %0d", (VCD_START == 0) ? 1 : VCD_START);
+        $display("TB_WIN_LINES          : %0d", w_lines);
+        $display("TB_WIN_COND_BR        : %0d", w_cond);
+        $display("TB_WIN_CYCLES         : %0d", w_cycles);
+        $display("TB_WIN_SRAM_READS     : %0d", w_sram_rd);
+        $display("TB_WIN_SRAM_WRITES    : %0d", w_sram_wr);
 
         if (n_lines == 0) fail("stimulus file contains no branch lines");
+        if (!in_win)
+            fail($sformatf("the activity window (VCD_START %0d) never opened: the dump has %0d branch lines",
+                           VCD_START, n_lines));
         if (n_mis_rtl != n_mis_ref)
             fail($sformatf("misprediction count differs: rtl %0d ref %0d", n_mis_rtl, n_mis_ref));
 
