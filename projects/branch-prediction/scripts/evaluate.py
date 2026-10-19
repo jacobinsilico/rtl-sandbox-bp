@@ -15,6 +15,15 @@
 #          --rtl-passes N runs the first N passes of a multi-pass dump
 #          (branches_per_pass lines each, from the dump's .json); otherwise
 #          --rtl-lines (0 = the whole dump).
+#     act  make sim (RTL, no VCD, no state check) from reset to the end of the
+#          activity window of the gls step (same --gls-warmup-passes /
+#          --gls-window-pct): the window counters, and per bp_sram instance
+#          its depth, width, reads, writes and same-cycle read + write counts
+#          (TB_SRAM_INST lines), for the whole run and the window. The
+#          per-instance sums must equal the bench's TB_SRAM_* and
+#          TB_WIN_SRAM_* totals, or the step fails. RTL and netlist run the
+#          same cycles, so where a gls record exists its window counters must
+#          match too (act_vs_gls in the CSV).
 #     syn  make syn of the core (the SRAMs stay outside, in the bench)
 #     sta  make post-syn-sta with IO_DELAY_PCT (default 0) and the extra
 #          reports of sta_reports.tcl (SDC hook): unclamped worst slack,
@@ -37,13 +46,14 @@
 #   Disk: the VCD is deleted once its DPA passed; the sim/ run directory of a
 #   passed rtl step, and of a gls step whose DPA passed, is deleted too (the
 #   step's make output stays in eval/). Failed runs keep everything for
-#   debugging. --keep-vcd / --keep-sim disable the cleanup. A gls step
+#   debugging (an act step's sim/ directory goes like an rtl step's).
+#   --keep-vcd / --keep-sim disable the cleanup. A gls step
 #   refuses to start below --min-free-gb free space. A DPA that has to run
 #   again after its VCD was deleted reruns the gls step.
 #
 #   Dumps may be deleted after a budget is evaluated (dump_eval.py does):
 #   a dump directory that keeps its .json / .log files still counts. Its
-#   records stay in the CSV and synthesis / STA still run; rtl and gls steps
+#   records stay in the CSV and synthesis / STA still run; rtl, act and gls steps
 #   report that the dump is gone instead of running (they never overwrite a
 #   finished record). Only budgets with dumps are run unless --budgets
 #   names them.
@@ -75,6 +85,12 @@
 # Output:
 #   projects/<project>/eval/<predictor>/<budget>/<step>.{log,json}
 #   projects/<project>/eval/<predictor>_results.csv   one row per budget x trace
+#   projects/<project>/eval/<predictor>_sram_counts.csv  one row per budget x
+#     trace x bp_sram instance (act step): name = <predictor>/<budget>/<instance>
+#     as in eval/cacti/arrays.csv, depth, width, rd, wr, rw (same-cycle read
+#     + write), rwa (... to the same address), the same in the window
+#     (win_*), the window's conditional branches and cycles, and per
+#     conditional branch rd_per_cond, wr_per_cond, rw_per_cond
 #   a summary table on stdout
 #
 #   Per conditional branch, per trace (gate-level run, SRAMs excluded):
@@ -90,7 +106,7 @@
 #     PREDICTOR          gshare | g_perceptron | hashed_perceptron | tage_cb
 #     --budgets 1KB 4KB  subset of budgets (default: all with dumps)
 #     --pilot 4KB        budget run first; stop if it fails (default: smallest)
-#     --steps rtl syn    subset of steps (default: rtl syn sta gls dpa)
+#     --steps rtl syn    subset of steps (default: rtl act syn sta gls dpa)
 #     --rtl-passes N     passes per RTL check (multi-pass dumps; 0 = use --rtl-lines)
 #     --rtl-lines N      branch lines per RTL check (default 0 = whole dump)
 #     --gls-warmup-passes W  activity window in pass W+1 (0 = from the start)
@@ -110,6 +126,8 @@
 #   Examples:
 #     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --print-params
 #     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --steps rtl --rtl-passes 1
+#     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py tage_cb --steps act --budgets 1KB \
+#         --clk 0.9 --gls-warmup-passes 5 --gls-window-pct 1
 #     /usr/bin/python3 projects/branch-prediction/scripts/evaluate.py hashed_perceptron --budgets 1KB \
 #         --clk 0.9 --gls-warmup-passes 5 --gls-window-pct 1
 #
@@ -140,7 +158,7 @@ SIM_DIR = os.path.join(PROJ_DIR, "sim")
 IMP_DIR = os.path.join(PROJ_DIR, "imp")
 STA_TCL = os.path.join(SCRIPT_DIR, "sta_reports.tcl")
 
-STEPS = ["rtl", "syn", "sta", "gls", "dpa"]
+STEPS = ["rtl", "act", "syn", "sta", "gls", "dpa"]
 
 # Defaults shared by evaluate.py and campaign.py: a campaign and a manual
 # run with the same settings produce the same step keys, so they reuse each
@@ -333,7 +351,52 @@ def tb_metrics(text):
             "TB_WIN_SRAM_READS", "TB_WIN_SRAM_WRITES"]
     m = {k.lower()[3:]: first([rf"^{k}\s*:\s*(\d+)"], text, int) for k in keys}
     m["passed"] = "PASSED" in text
+    inst = sram_instances(text)
+    if inst:
+        m["sram_inst"] = inst
     return m
+
+
+SRAM_INST_KEYS = ("DEPTH", "WIDTH", "RD", "WR", "RW", "RWA",
+                  "WIN_RD", "WIN_WR", "WIN_RW", "WIN_RWA")
+
+
+def inst_name(path):
+    """Bench-relative instance path of a %m name:
+    'TOP.tb_bp_hp_core.g_wt[0].i_wt' -> 'g_wt[0].i_wt' (sram_arrays.py's)."""
+    p = path.replace("__BRA__", "[").replace("__KET__", "]").replace("__DOT__", ".")
+    parts = p.split(".")
+    for i, s in enumerate(parts):
+        if s.startswith("tb_"):
+            return ".".join(parts[i + 1:])
+    return p[4:] if p.startswith("TOP.") else p
+
+
+def sram_instances(text):
+    """TB_SRAM_INST lines of bp_sram.sv -> {instance: {depth, width, rd, ...}}."""
+    out = {}
+    for path, rest in re.findall(r"^TB_SRAM_INST\s+(\S+)\s+(.*)$", text, re.MULTILINE):
+        tok = rest.split()
+        kv = dict(zip(tok[0::2], tok[1::2]))
+        try:
+            out[inst_name(path)] = {k.lower(): int(kv[k]) for k in SRAM_INST_KEYS}
+        except (KeyError, ValueError):
+            continue
+    return out
+
+
+def sram_inst_check(m):
+    """None if the per-instance counts add up to the bench's totals, else why not."""
+    inst = m.get("sram_inst")
+    if not inst:
+        return "no TB_SRAM_INST lines (is the per-instance bp_sram.sv compiled?)"
+    bad = []
+    for k_inst, k_tb in (("rd", "sram_reads"), ("wr", "sram_writes"),
+                         ("win_rd", "win_sram_reads"), ("win_wr", "win_sram_writes")):
+        tot = sum(v[k_inst] for v in inst.values())
+        if m.get(k_tb) is not None and tot != m[k_tb]:
+            bad.append(f"sum {k_inst} {tot} != TB_{k_tb.upper()} {m[k_tb]}")
+    return "; ".join(bad) or None
 
 
 def file_sig(path):
@@ -725,6 +788,11 @@ class Budget:
             state = stem + ".state" if self.spec["state"] and os.path.exists(stem + ".state") else ""
             return (f"{self.top}|{p}|src {self.src}|dump {file_sig(stem + '.golden.txt')}|"
                     f"{self.rtl_lines(step[4:])}|{a.clk}|{state} {file_sig(state) if state else ''}")
+        if step.startswith("act_"):
+            stem = self.traces[step[4:]]
+            start, end = self.gls_window(step[4:])
+            return (f"{self.top}|{p}|src {self.src}|dump {file_sig(stem + '.golden.txt')}|"
+                    f"act {start}-{end}|{a.clk}")
         if step in ("syn", "syn_hier"):
             return f"{self.top}|{p}|src {self.src}|{a.clk}|{step == 'syn_hier'}"
         syn_key = (self.load("syn") or {}).get("key")
@@ -742,8 +810,8 @@ class Budget:
     def run_step(self, step, force=False):
         """Runs one step unless finished; returns a status string."""
         t0, a, kind = time.time(), self.args, step.split("_")[0]
-        trace = step.split("_", 1)[1] if step.startswith(("rtl_", "gls_", "dpa_")) else None
-        if kind in ("rtl", "gls") and not self.has_dump(trace):
+        trace = step.split("_", 1)[1] if step.startswith(("rtl_", "act_", "gls_", "dpa_")) else None
+        if kind in ("rtl", "act", "gls") and not self.has_dump(trace):
             # never overwrite a finished record because its dump was deleted
             rec = self.load(step) or {}
             return ("FAILED (dump deleted; regenerate it with dump_eval.py)"
@@ -772,6 +840,25 @@ class Budget:
             ok = rc == 0 and m["passed"]
             if ok and not a.keep_sim and not a.dry_run:
                 remove_tree(self.sim_dir("sim", trace))
+        elif kind == "act":
+            stem = self.traces[trace]
+            start, end = self.gls_window(trace)
+            par = f"{p} MAX_LINES={end} {quoted('STIM_FILE', stem + '.golden.txt')}"
+            if start:
+                par += f" VCD_START={start}"
+            rc, text = make(a, "sim", base + [("OUT_DIR", f"act_{self.tag}_{trace}"),
+                                              ("PARAMS", par)], logf)
+            m = tb_metrics(text)
+            m.update(clk_ns=a.clk, vcd_start=start, max_lines=end)
+            ok = rc == 0 and m["passed"]
+            err = None if a.dry_run else sram_inst_check(m)
+            if ok and err:
+                ok, m["error"] = False, err
+            if ok and start and m.get("win_start") not in (None, start):
+                ok = False
+                m["error"] = f"bench window starts at line {m.get('win_start')}, expected {start}"
+            if ok and not a.keep_sim and not a.dry_run:
+                remove_tree(self.sim_dir("act", trace))
         elif kind == "syn":
             out = f"syn_{self.tag}" + ("_hier" if step == "syn_hier" else "")
             var = base + [("OUT_DIR", out), ("PARAMS", p)]
@@ -842,10 +929,11 @@ class Budget:
         if a.dry_run:
             return "dry"
         self.save(step, key, ok, m, t0)
-        if kind in ("rtl", "gls"):
+        if kind in ("rtl", "act", "gls"):
             extra = f"  state lines={m.get('state_lines')}" if m.get("state_lines") else ""
             extra += (f"  window lines {m.get('win_start')}+{m.get('win_lines')}"
-                      if kind == "gls" and m.get("vcd_start") else "")
+                      if kind in ("act", "gls") and m.get("vcd_start") else "")
+            extra += f"  {len(m['sram_inst'])} SRAMs" if kind == "act" and m.get("sram_inst") else ""
             extra += f"  vcd {m['vcd_mb']} MB" if m.get("vcd_mb") else ""
             extra += f"  {m['error']}" if m.get("error") else ""
             return (f"{'ok' if ok else 'FAILED'}  lines={m.get('lines')} cond={m.get('cond_br')} "
@@ -860,6 +948,8 @@ class Budget:
         order = []
         if "rtl" in a.steps:
             order += [f"rtl_{t}" for t in self.traces]
+        if "act" in a.steps:
+            order += [f"act_{t}" for t in self.traces]
         if "syn" in a.steps:
             order += ["syn"] + (["syn_hier"] if a.hier else [])
         if "sta" in a.steps:
@@ -935,8 +1025,44 @@ class Budget:
                                  ("p_leakage_w", "e_leak_pj_per_cond")):
                     if dpa.get(src) is not None:
                         r[dst] = round(dpa[src] * t_per_cond * 1e12, 4)
+            # RTL activity run (act): window counters, and whether they equal the
+            # gate-level run's (same design, same cycles)
+            act = met(f"act_{trace}")
+            r["act_pass"] = act.get("passed", "")
+            r["act_win_cond_br"] = act.get("win_cond_br", "")
+            if act.get("win_cond_br"):
+                ac = act["win_cond_br"]
+                r["act_cycles_per_cond"] = round((act.get("win_cycles") or 0) / ac, 4)
+                r["act_sram_rd_per_cond"] = round((act.get("win_sram_reads") or 0) / ac, 4)
+                r["act_sram_wr_per_cond"] = round((act.get("win_sram_writes") or 0) / ac, 4)
+            keys = ("win_start", "win_lines", "win_cond_br", "win_cycles", "win_sram_reads",
+                    "win_sram_writes")
+            if act.get("win_cond_br") and gls.get("win_cond_br"):
+                r["act_vs_gls"] = ("match" if all(act.get(k) == gls.get(k) for k in keys)
+                                   else "DIFFERS")
             r["area_by_module"] = ";".join(f"{k}:{v}" for k, v in hier.items())
             out.append(r)
+        return out
+
+    def sram_rows(self):
+        """One row per trace x bp_sram instance, from the act records."""
+        out = []
+        for trace in self.traces:
+            rec = self.load(f"act_{trace}") or {}
+            if rec.get("status") != "ok":
+                continue
+            m = rec.get("metrics") or {}
+            wc = m.get("win_cond_br") or 0
+            for inst, v in sorted((m.get("sram_inst") or {}).items()):
+                r = {"predictor": self.args.predictor, "budget": self.label, "budget_kb": self.kb,
+                     "trace": trace, "config_id": self.cid,
+                     "name": f"{self.args.predictor}/{self.label}/{inst}", "instance": inst}
+                r.update(v)
+                r.update(win_start=m.get("win_start"), win_lines=m.get("win_lines"),
+                         win_cond_br=m.get("win_cond_br"), win_cycles=m.get("win_cycles"))
+                for k in ("rd", "wr", "rw"):
+                    r[f"{k}_per_cond"] = round(v[f"win_{k}"] / wc, 6) if wc else ""
+                out.append(r)
         return out
 
 
@@ -1030,8 +1156,17 @@ def evaluate_predictor(predictor, opts):
 
     # The CSV is rebuilt from the records of every budget, run now or before.
     rows = [r for b in budgets for r in b.rows()
-            if any(r.get(k) not in ("", None) for k in ("rtl_pass", "area_um2", "p_total_w"))]
+            if any(r.get(k) not in ("", None)
+                   for k in ("rtl_pass", "act_pass", "area_um2", "p_total_w"))]
     write_csv(os.path.join(EVAL_DIR, f"{predictor}_results.csv"), rows)
+    srows = [r for b in budgets for r in b.sram_rows()]
+    if srows:
+        write_csv(os.path.join(EVAL_DIR, f"{predictor}_sram_counts.csv"), srows)
+    differs = sorted({f"{r['budget']} {r['trace']}" for r in rows if r.get("act_vs_gls") == "DIFFERS"},
+                     key=lambda x: budget_key(x.split()[0]))
+    if differs:
+        log(f"WARNING {predictor}: RTL (act) and netlist (gls) window counters differ for "
+            + ", ".join(differs))
     return all_ok, rows
 
 

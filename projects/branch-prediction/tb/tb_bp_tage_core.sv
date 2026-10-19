@@ -266,6 +266,7 @@ module tb_bp_tage_core #(
 
     // -------------------------------------------------------------------------
     // Shadow copy of every table, from the SRAM write ports (for the checksum)
+    /* verilator tracing_off */   // bench-only arrays: never dumped
     // -------------------------------------------------------------------------
     logic [ROW_W-1:0] sh_tb [NB][ROWS];
     logic             sh_bp [BIM_N];

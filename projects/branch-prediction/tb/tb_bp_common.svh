@@ -40,6 +40,11 @@
 //     for the activity window TB_WIN_START (its first branch line),
 //     TB_WIN_LINES, TB_WIN_COND_BR, TB_WIN_CYCLES, TB_WIN_SRAM_READS,
 //     TB_WIN_SRAM_WRITES.
+//   Per SRAM instance: the bench switches the bp_sram access counters
+//   (bp_sram_pkg::count_en at reset release, bp_sram_pkg::win_en when the
+//   window opens, together with its own counters), and every bp_sram prints
+//   a TB_SRAM_INST line from its final block, after the report (format in
+//   bp_sram.sv). Their sums equal TB_SRAM_* and TB_WIN_SRAM_*.
 //
 //   The including module must declare, BEFORE this include:
 //     parameters  STIM_FILE (string), MAX_LINES, VCD_START, TIMEOUT_CYCLES
@@ -106,9 +111,12 @@
     endtask
 
     // Opens the activity window: from here on the VCD records and the
-    // window counters count.
+    // window counters (the bench's and every bp_sram's) count.
     task automatic open_window(input longint unsigned at_line);
         in_win = 1'b1;
+`ifdef VERILATOR
+        bp_sram_pkg::win_en = 1'b1;
+`endif
 `ifdef VCD
         $dumpvars(0, dut);
 `endif
@@ -187,6 +195,10 @@
         longint unsigned w_lines;
         longint unsigned w_cond;
 
+`ifdef VERILATOR
+        bp_sram_pkg::count_en = 1'b0;         // per-instance SRAM counters off
+        bp_sram_pkg::win_en   = 1'b0;         // until reset / the window
+`endif
         stim = STIM_FILE;
         void'($value$plusargs("STIM=%s", stim));
         if (stim == "") fail("no stimulus file: pass +STIM=<path> or set STIM_FILE");
@@ -222,6 +234,9 @@
         #(T_SETTLE);
         rst_ni   = 1'b1;
         counting = 1'b1;
+`ifdef VERILATOR
+        bp_sram_pkg::count_en = 1'b1;
+`endif
 
         while ($fgets(line, fd) != 0) begin
             lineno++;

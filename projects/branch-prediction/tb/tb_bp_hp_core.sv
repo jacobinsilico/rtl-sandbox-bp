@@ -324,6 +324,7 @@ module tb_bp_hp_core #(
 
     // -------------------------------------------------------------------------
     // Shadow copy of every weight (bias at 0.., table t at e_base(t)..)
+    /* verilator tracing_off */   // bench-only arrays: never dumped
     // -------------------------------------------------------------------------
     logic [7:0] sh [SH_N];
 

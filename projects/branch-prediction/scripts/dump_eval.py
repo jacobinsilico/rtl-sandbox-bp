@@ -12,8 +12,9 @@ PER SELECTED CONFIG (family, budget)
     1. dump      01_golden_dump.py (CBP5 repo) on the three core traces,
                  --max-passes PASSES (default 6), with the predictor's
                  internal-state trace (TAGE: TAGE_CB_STATE, hashed
-                 perceptron: HP_STATE), into a staging directory on the same
-                 disk (stim/.staging/). Skipped when stim/ already holds a
+                 perceptron: HP_STATE) when the rtl step runs (only it reads
+                 the state), into a staging directory on the same disk
+                 (stim/.staging/). Skipped when stim/ already holds a
                  complete dump of this config with the same pass count.
     2. place     every other dump directory of this budget is removed (
                  evaluate.py refuses two), the new one is moved to
@@ -25,16 +26,19 @@ PER SELECTED CONFIG (family, budget)
                  --clk, --rtl-passes, --gls-warmup-passes, --gls-window-pct
     4. check     evaluate.py's exit status, and in its records: every step ok,
                  the RTL run covered the expected lines, the state was checked
-                 as far as the state trace goes, the activity window starts
-                 and ends where it should
+                 as far as the state trace goes, the activity window (act and
+                 gls) starts and ends where it should
     5. clean     the dumps and state traces are deleted (--keep-dumps keeps
                  them); the .json / .log stay, so evaluate.py still lists the
                  budget and its records stay in the CSV; a marker
-                 (dump_eval.done) records the options of the finished run
+                 (dump_eval.done) records the options and every step done
+                 with them (the steps of earlier runs are kept)
     A failed step keeps everything (staging, dumps) and stops (--keep-going:
-    go on with the next config). A config whose marker matches the current
-    options is skipped; --redo runs it again (the dump is regenerated from the
-    ledger config, deterministically).
+    go on with the next config). A config whose marker has the current
+    options and every requested step done is skipped; --redo runs it again
+    (the dump is regenerated from the ledger config, deterministically). So a
+    later run with a new step (e.g. --steps act) regenerates the dumps of the
+    finished configs and runs only that step.
 
 PATHS  (CBP5 repo = --cbp, default /home/j50065913/cbp5-wireless/cbp5-new-golden)
     selection   <cbp>/scripts/bp-comparison/analysis/traces_csv_long/rtl_compare/
@@ -51,6 +55,9 @@ USAGE  (RTL repo root, after `source sourceme.sh`)
           --families gshare --budgets 1 --steps rtl --rtl-passes 1 --keep-dumps
     everything, 1 GHz, power on 1 % of pass 6 after 5 warm-up passes
       /usr/bin/python3 projects/branch-prediction/scripts/dump_eval.py --clk 0.9
+    per-SRAM-instance access counts (RTL to the end of the activity window)
+    for every finished config: the dumps are made again, act runs, they go
+      /usr/bin/python3 projects/branch-prediction/scripts/dump_eval.py --steps act
     one family:  --families tcb      the plan only:  --dry-run
 """
 
@@ -139,21 +146,40 @@ class Job:
         self.edir = os.path.join(PROJ_DIR, "eval", self.F["stim"], self.label)
         self.logs = os.path.join(PROJ_DIR, "eval", "dump_eval")
         self.state = bool(self.F["state_env"]) and a.state_passes != 0
+        self.need_state = self.state and "rtl" in a.steps   # only the rtl step reads it
         self.opts = {"config_id": self.cid, "passes": a.passes,
                      "state_passes": a.state_passes if self.state else 0,
-                     "steps": sorted(a.steps), "clk": a.clk, "rtl_passes": a.rtl_passes,
+                     "clk": a.clk, "rtl_passes": a.rtl_passes,
                      "gls_warmup_passes": a.gls_warmup_passes, "gls_window_pct": a.gls_window_pct}
+        # read now: a new dump replaces the directory, marker included
+        self.marker_diff = []
+        self.prev_done = self.marker_steps()
 
     def name(self):
         return f"{self.fam} {self.label} {self.cid}"
 
     # ---- state on disk ----
-    def finished(self):
-        """Marked complete with these options, AND its records still pass
-        today's checks (a marker from an older, laxer flow vouches for
-        nothing: e.g. a DPA record without power)."""
+    def marker_steps(self):
+        """Steps the marker records as done with the current options (an empty
+        set when there is no marker or its options differ). The first marker
+        format kept the steps of its one run in the options."""
         m = load_json(os.path.join(self.dest, MARKER))
-        if not (bool(m) and m.get("complete") and m.get("options") == self.opts):
+        if not (m and m.get("complete")):
+            return set()
+        opts = dict(m.get("options") or {})
+        old_steps = opts.pop("steps", None)
+        if opts != self.opts:
+            self.marker_diff = [f"{k} {opts.get(k)} -> {self.opts.get(k)}"
+                                for k in sorted(set(opts) | set(self.opts))
+                                if opts.get(k) != self.opts.get(k)]
+            return set()
+        return set(m.get("steps_done", old_steps or []))
+
+    def finished(self):
+        """Marked complete with these options and every requested step, AND
+        its records still pass today's checks (a marker from an older, laxer
+        flow vouches for nothing: e.g. a DPA record without power)."""
+        if not set(self.a.steps) <= self.marker_steps():
             return False
         probs = self.check(0)
         if probs:
@@ -177,7 +203,7 @@ class Job:
                 return False
             if not os.path.exists(os.path.join(self.dest, t + ".golden.txt")):
                 return False
-            if self.state and not os.path.exists(os.path.join(self.dest, t + ".state")):
+            if self.need_state and not os.path.exists(os.path.join(self.dest, t + ".state")):
                 return False
         return True
 
@@ -195,7 +221,7 @@ class Job:
                "--trace-kind", "long", "--max-passes", str(a.passes),
                "--only-traces", *CORE_TRACES, "--out-dir", self.staging,
                "--jobs", str(a.dump_jobs)]
-        if self.state:
+        if self.need_state:
             cmd += ["--trace-env", self.F["state_env"]]
         rc = run(cmd, os.path.join(self.logs, f"{self.F['stim']}_{self.label}_dump.log"), a.dry_run)
         if a.dry_run:
@@ -213,7 +239,7 @@ class Job:
         for t, m in metas.items():
             for ext in (".golden.txt", ".log", ".json"):
                 os.replace(os.path.join(src, t + ext), os.path.join(self.dest, t + ext))
-            if self.state:
+            if self.need_state:
                 tr = os.path.join(src, t + ".trace.txt")
                 st = os.path.join(self.dest, t + ".state")
                 if self.a.state_passes >= self.a.passes:
@@ -257,17 +283,19 @@ class Job:
                     if mm.get("state_lines") != st:
                         probs.append(f"rtl_{short}: state checked for {mm.get('state_lines')} "
                                      f"branches, expected {st}")
-            if "gls" in a.steps:
-                r = rec(f"gls_{short}")
+            for kind in [k for k in ("act", "gls") if k in a.steps]:
+                r = rec(f"{kind}_{short}")
                 mm = r.get("metrics", {})
                 if r.get("status") != "ok":
-                    probs.append(f"gls_{short}: {r.get('status', 'no record')}")
+                    probs.append(f"{kind}_{short}: {r.get('status', 'no record')}")
                 elif a.gls_warmup_passes:
                     start = a.gls_warmup_passes * bpp + 1
                     n = max(1, int(round(bpp * a.gls_window_pct / 100.0)))
                     if (mm.get("win_start"), mm.get("win_lines")) != (start, n):
-                        probs.append(f"gls_{short}: window {mm.get('win_start')}+{mm.get('win_lines')}, "
-                                     f"expected {start}+{n}")
+                        probs.append(f"{kind}_{short}: window {mm.get('win_start')}+"
+                                     f"{mm.get('win_lines')}, expected {start}+{n}")
+                if kind == "act" and r.get("status") == "ok" and not mm.get("sram_inst"):
+                    probs.append(f"act_{short}: ok but no per-instance SRAM counts in its record")
             if "dpa" in a.steps and rec(f"dpa_{short}").get("status") == "ok" \
                     and rec(f"dpa_{short}").get("metrics", {}).get("p_total_w") is None:
                 probs.append(f"dpa_{short}: ok but no power in its record")
@@ -284,9 +312,10 @@ class Job:
         return removed
 
     def mark(self, kept):
+        done = sorted(self.prev_done | set(self.a.steps))
         with open(os.path.join(self.dest, MARKER), "w") as f:
-            json.dump({"complete": True, "options": self.opts, "dumps_kept": kept,
-                       "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=1)
+            json.dump({"complete": True, "options": self.opts, "steps_done": done,
+                       "dumps_kept": kept, "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=1)
 
     # ---- the whole cycle ----
     def go(self):
@@ -295,6 +324,9 @@ class Job:
         old = os.path.join(self.dest, OLD_MARKER)
         if os.path.exists(old) and not a.dry_run:
             os.remove(old)                   # it made evaluate.py skip this budget
+        if self.marker_diff:
+            log(f"    WARNING its marker was written with other options ({', '.join(self.marker_diff)}): "
+                f"the steps it records are not carried over")
         if not a.redo and self.finished():
             if not a.keep_dumps and not a.dry_run and \
                     glob.glob(os.path.join(self.dest, "*.golden.txt")):
@@ -340,8 +372,8 @@ def main():
     ap.add_argument("--passes", type=int, default=6, help="passes per dump (6)")
     ap.add_argument("--state-passes", type=int, default=1,
                     help="passes kept in the state traces (1; 0 = no state trace)")
-    ap.add_argument("--steps", nargs="+", default=["rtl", "syn", "sta", "gls", "dpa"],
-                    choices=["rtl", "syn", "sta", "gls", "dpa"])
+    ap.add_argument("--steps", nargs="+", default=["rtl", "act", "syn", "sta", "gls", "dpa"],
+                    choices=["rtl", "act", "syn", "sta", "gls", "dpa"])
     ap.add_argument("--clk", default="0.9", help="clock period, ns (0.9)")
     ap.add_argument("--rtl-passes", type=int, default=0,
                     help="passes per RTL check (0 = the whole dump)")
@@ -375,7 +407,8 @@ def main():
                     ("dump script", a.dump_script), ("evaluate.py", EVALUATE)):
         if not os.path.exists(p):
             sys.exit(f"dump_eval: no {what} {p}")
-    if a.gls_warmup_passes and a.gls_warmup_passes >= a.passes and "gls" in a.steps:
+    if a.gls_warmup_passes and a.gls_warmup_passes >= a.passes \
+            and ("gls" in a.steps or "act" in a.steps):
         sys.exit(f"dump_eval: the window needs pass {a.gls_warmup_passes + 1}, "
                  f"the dumps have {a.passes}")
     if a.rtl_passes > a.passes:
