@@ -27,14 +27,21 @@
 #                          input pins and net names
 #     pred_path.rpt        the worst path ending at pred_resp_taken_o (the
 #                          prediction path), if the design has that port
+#     rdata_path.rpt       the worst path starting at an SRAM read-data port
+#                          (to a flop or an output port), if the design has
+#                          them: ppa_combine.py replaces the SRAM_CLK2Q_PS
+#                          placeholder in it by the CACTI access time, even
+#                          when it is not the worst path overall
 #     worst_endpoints.rpt  the 20 worst endpoints, one line each
-#   evaluate.py parses "Startpoint:" / "Endpoint:" in worst_path.rpt and
-#   "data arrival time" in pred_path.rpt. Options an older OpenSTA might
-#   lack sit inside catch: a missing option drops back to the plain report
-#   (or skips the extra one) instead of failing the STA run.
+#   evaluate.py parses "Startpoint:" / "Endpoint:" in worst_path.rpt,
+#   "data arrival time" in pred_path.rpt and "slack" / "Endpoint:" in
+#   rdata_path.rpt. Options an older OpenSTA might lack sit inside catch: a
+#   missing option drops back to the plain report (or skips the extra one)
+#   instead of failing the STA run.
 #   Critical delay (evaluate.py) = period - worst slack: the shortest period
-#   that would meet timing with these I/O budgets. The prediction-path
-#   arrival includes the SRAM clock-to-Q when the path starts at read data.
+#   that would meet timing with these I/O budgets; the same for the read
+#   path (rdata_crit_ps). The prediction-path arrival includes the SRAM
+#   clock-to-Q when the path starts at read data.
 #   Times are in the library unit (ps for ASAP7).
 # -----------------------------------------------------------------------------
 
@@ -73,6 +80,14 @@ if {[llength [get_ports -quiet pred_resp_taken_o]] > 0} {
         puts "sta_reports.tcl: prediction path without net names ($err)"
         report_checks -path_delay max -to [get_ports pred_resp_taken_o] -digits 4 \
             > $REPORT_DIR/pred_path.rpt
+    }
+}
+
+if {[llength $sram_in] > 0} {
+    if {[catch {report_checks -path_delay max -from $sram_in -digits 4 \
+                    -fields {input_pin net} > $REPORT_DIR/rdata_path.rpt} err]} {
+        puts "sta_reports.tcl: SRAM read path without net names ($err)"
+        report_checks -path_delay max -from $sram_in -digits 4 > $REPORT_DIR/rdata_path.rpt
     }
 }
 

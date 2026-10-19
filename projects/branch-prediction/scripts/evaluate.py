@@ -27,7 +27,9 @@
 #     syn  make syn of the core (the SRAMs stay outside, in the bench)
 #     sta  make post-syn-sta with IO_DELAY_PCT (default 0) and the extra
 #          reports of sta_reports.tcl (SDC hook): unclamped worst slack,
-#          critical delay = period - worst slack, prediction-path delay
+#          critical delay = period - worst slack, prediction-path delay, and
+#          the period the worst path from an SRAM read port needs
+#          (rdata_crit_ps, with the SRAM clock-to-Q placeholder in it)
 #     gls  make post-syn-sim VCD=1 on every trace: the netlist checked against
 #          the dump again, and its activity. Activity window:
 #            --gls-warmup-passes W (> 0): the first W passes warm the
@@ -508,7 +510,7 @@ def parse_area_hier(out_dir):
 def parse_sta(out_dir, clk_ns):
     rep = os.path.join(IMP_DIR, out_dir, "report")
     files = {n: os.path.join(rep, n + ".rpt")
-             for n in ("wns", "tns", "worst_slack", "worst_path", "pred_path")}
+             for n in ("wns", "tns", "worst_slack", "worst_path", "pred_path", "rdata_path")}
     txt = {n: read(p) for n, p in files.items()}
     m = {
         "wns": first([r"^\s*wns\s+(?:max\s+)?(-?[\d.]+)"], txt["wns"]),
@@ -517,7 +519,14 @@ def parse_sta(out_dir, clk_ns):
         "crit_start": first([r"Startpoint:\s*(\S+)"], txt["worst_path"], str),
         "crit_end": first([r"Endpoint:\s*(\S+)"], txt["worst_path"], str),
         "pred_path_ps": first([r"^\s*(-?[\d.]+)\s+data arrival time"], txt["pred_path"]),
+        # worst path from an SRAM read port (sta_reports.tcl): its arrival
+        # includes the SRAM clock-to-Q placeholder
+        "rdata_slack_ps": first([r"^\s*(-?[\d.]+)\s+slack"], txt["rdata_path"]),
+        "rdata_end": first([r"Endpoint:\s*(\S+)"], txt["rdata_path"], str),
     }
+    # the period that path alone needs: arrival + setup (or + output delay)
+    m["rdata_crit_ps"] = (round(float(clk_ns) * 1000.0 - m["rdata_slack_ps"], 2)
+                          if m["rdata_slack_ps"] is not None else None)
     m["crit_delay_ps"] = (round(float(clk_ns) * 1000.0 - m["worst_slack_ps"], 2)
                           if m["worst_slack_ps"] is not None else None)
     warn_missing("sta", m, ["worst_slack_ps", "crit_start", "pred_path_ps"],
@@ -537,8 +546,11 @@ def parse_power(out_dir):
         if group == "Total" and g:
             m["p_internal_w"], m["p_switching_w"], m["p_leakage_w"] = \
                 float(g.group(1)), float(g.group(2)), float(g.group(3))
-    m["vcd_annotated"] = first([r"(\d+)"], read(os.path.join(rep, "vcd_annotated.rpt")), int)
-    m["vcd_unannotated"] = first([r"(\d+)"], read(os.path.join(rep, "vcd_unannotated.rpt")), int)
+    # both reports start with the same two summary lines ("vcd N" and
+    # "unannotated M"), then list the pins: read the counts off those lines
+    ann = read(os.path.join(rep, "vcd_annotated.rpt")) or read(os.path.join(rep, "vcd_unannotated.rpt"))
+    m["vcd_annotated"] = first([r"^\s*vcd\s+(\d+)\s*$"], ann, int)
+    m["vcd_unannotated"] = first([r"^\s*unannotated\s+(\d+)\s*$"], ann, int)
     warn_missing("dpa", m, ["p_total_w"], files)
     return m
 
@@ -995,7 +1007,7 @@ class Budget:
             for k in ("area_um2", "cells", "flops"):
                 r[k] = syn.get(k, "")
             for k in ("crit_delay_ps", "pred_path_ps", "worst_slack_ps", "wns", "tns",
-                      "crit_start", "crit_end"):
+                      "crit_start", "crit_end", "rdata_crit_ps", "rdata_end"):
                 r[k] = sta.get(k, "")
             r["gls_pass"] = gls.get("passed", "")
             r["gls_clk_ns"] = gls.get("clk_ns", "")

@@ -16,7 +16,10 @@
 #                      names (41-50, or 6-10 for configs with 10 passes); its
 #                      geomean over the traces is checked against the
 #                      selection's steady_mpkbr. --mpkbr rtl: the RTL check's
-#                      count instead (pass 1: a cold predictor).
+#                      count instead (pass 1: a cold predictor). The plotted
+#                      MPKBr is also written to <ppa>/mpkbr_<mode>.csv
+#                      (predictor, budget_kb, trace, config_id, mpkbr,
+#                      window), which ppa_combine.py reads by default.
 #     energy_<scale>   logic energy per conditional branch, one column per
 #                      trace: evaluate.py's e_logic_pj_per_cond -- power,
 #                      cycles and branches all of the activity window
@@ -28,6 +31,18 @@
 #                      prediction latency in ns at that period, the
 #                      prediction-path delay of the last stage, and the busy
 #                      cycles per conditional branch.
+#   Once ppa_combine.py has written <ppa>/ppa_table.csv (logic + SRAM):
+#     total_<scale>    total energy per conditional branch (logic + SRAM
+#                      reads / writes + SRAM leakage) and total area (logic +
+#                      SRAM), in ppa_combine.py's baseline scenario; the band
+#                      is the range over its sensitivity corners (scenarios,
+#                      host cycles per branch, SRAM energy / area factors).
+#                      Also the SRAM share of the energy, and the cycle the
+#                      logic needs with the CACTI access time in place of the
+#                      200 ps placeholder (pessimistic bound; dashed: target).
+#     tradeoff_<scale> total energy and total area against MPKBr (mean over
+#                      the traces), one curve per predictor through its
+#                      budgets (labelled in KB / AU).
 #
 #   Prediction latency = cycles from the request handshake to pred_resp_valid
 #   (LATENCY below, from the cores' pipelining knobs) x clock period. At a
@@ -41,8 +56,9 @@
 #   Every figure is written twice: <scale> = log (log y axis) and linear (y
 #   axis from 0). x axis: storage budget in area units, 1 AU = 1 KB.
 #
-#   Logic only: the SRAMs are outside the synthesized core, so neither the
-#   power nor the energy includes them. Rows of the old flow (no activity
+#   mpkbr / energy / ppa / latency are logic only: the SRAMs are outside the
+#   synthesized core, so neither the power nor the energy includes them (the
+#   total / tradeoff figures do). Rows of the old flow (no activity
 #   window: empty gls_win_lines) are skipped for power, energy and accesses,
 #   and named. The plotted values are printed as tables, plus the sequential
 #   share of the logic energy (flops, mostly clocking: no clock gating).
@@ -64,6 +80,10 @@
 #                        the energy columns
 #     --max-kb KB        plot only budgets up to KB (default: all budgets)
 #     --out DIR          default eval/plots/
+#     --ppa DIR          ppa_combine.py's output (default eval/ppa/): where the
+#                        MPKBr CSV goes and the total / tradeoff data comes from
+#     --mpkbr-csv PATH   MPKBr CSV (default <ppa>/mpkbr_<mode>.csv; none = not
+#                        written; not written with --max-kb unless given)
 #     --format FMT       png | pdf | svg (default png)
 #
 #   Examples:
@@ -77,6 +97,12 @@
 #   <out>/energy_log.<fmt>   <out>/energy_linear.<fmt>
 #   <out>/ppa_log.<fmt>      <out>/ppa_linear.<fmt>
 #   <out>/latency_log.<fmt>  <out>/latency_linear.<fmt>
+#   <out>/total_log.<fmt>    <out>/total_linear.<fmt>      (with ppa_combine.py's output)
+#   <out>/tradeoff_log.<fmt> <out>/tradeoff_linear.<fmt>   (with ppa_combine.py's output)
+#   <ppa>/mpkbr_<mode>.csv
+#
+#   Order for the logic + SRAM figures: plot_ppa.py (writes the MPKBr CSV),
+#   ppa_combine.py, plot_ppa.py again (draws total / tradeoff).
 # -----------------------------------------------------------------------------
 
 import argparse
@@ -232,16 +258,23 @@ def steady(passes, window):
     return (1000.0 * sum(x[0] for x in sel) / c if c else None), window
 
 
+def kb_text(kb):
+    return int(kb) if float(kb).is_integer() else kb
+
+
 def mpkbr_series(rows, traces, a):
-    """{trace: {predictor: [(kb, mpkbr)]}}"""
+    """-> ({trace: {predictor: [(kb, mpkbr)]}}, [CSV record per predictor x budget x trace])"""
     out = {t: defaultdict(list) for t in traces}
+    recs = []
     if a.mpkbr == "rtl":
         for (p, kb, t), r in sorted(rows.items()):
             m = num(r.get("mpkbr"))
             if t in out and m is not None:
                 out[t][p].append((kb, m))
+                recs.append({"predictor": p, "budget_kb": kb_text(kb), "trace": t,
+                             "config_id": r.get("config_id"), "mpkbr": m, "window": "rtl pass 1"})
         print("  MPKBr: the RTL check's count (pass 1, a cold predictor)")
-        return out
+        return out, recs
 
     if not os.path.exists(a.ledger):
         sys.exit(f"no CBP5 ledger {a.ledger}: give --ledger / --cbp, or --mpkbr rtl")
@@ -267,13 +300,76 @@ def mpkbr_series(rows, traces, a):
             out[t][p].append((kb, v))
             vals[t] = v
             windows[f"{win[0]}-{win[1]}"].append(f"{p}:{kb:g}KB")
+            recs.append({"predictor": p, "budget_kb": kb_text(kb), "trace": t, "config_id": cid,
+                         "mpkbr": v, "window": f"{win[0]}-{win[1]}"})
         g = geomean(list(vals.values())) if len(vals) == len(traces) else None
         if g and s.get("steady") and abs(g / s["steady"] - 1) > 0.005:
             print(f"WARNING {p} {kb:g}KB: geomean {g:.4f} != the selection's {s['steady']:.4f}")
     for w, runs in sorted(windows.items()):
         print(f"  MPKBr: CBP5 steady, passes {w}: {len(set(runs))} configs"
               + ("" if len(windows) == 1 else f" ({' '.join(sorted(set(runs)))})"))
-    return out
+    return out, recs
+
+
+def write_mpkbr_csv(path, recs):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["predictor", "budget_kb", "trace", "config_id", "mpkbr",
+                                          "window"], lineterminator="\n")
+        w.writeheader()
+        w.writerows(recs)
+    print(f"  MPKBr per trace -> {path} (read by ppa_combine.py)")
+
+
+# ---- logic + SRAM (ppa_combine.py) -------------------------------------------
+
+def load_combined(ppa_dir, max_kb):
+    """ppa_combine.py's baseline table and sensitivity -> ({predictor: {kb: row}},
+    {(predictor, kb): sensitivity row}), or None before ppa_combine.py ran."""
+    tp, sp = os.path.join(ppa_dir, "ppa_table.csv"), os.path.join(ppa_dir, "sensitivity.csv")
+    if not os.path.exists(tp):
+        return None
+    base, sens = defaultdict(dict), {}
+    with open(tp, newline="") as f:
+        for r in csv.DictReader(f):
+            kb = num(r.get("budget_kb"))
+            if r.get("predictor") in STYLE and kb is not None and (max_kb is None or kb <= max_kb):
+                base[r["predictor"]][kb] = r
+    if os.path.exists(sp):
+        with open(sp, newline="") as f:
+            for r in csv.DictReader(f):
+                kb = num(r.get("budget_kb"))
+                if r.get("predictor") in STYLE and kb is not None:
+                    sens[(r["predictor"], kb)] = r
+    return base, sens
+
+
+def combined_series(base, sens):
+    """-> panels and bands of the total figure, from ppa_combine.py's output."""
+    keys = ("energy", "area", "sram_share", "period")
+    out = {k: defaultdict(list) for k in keys}
+    bands = {"energy": defaultdict(list), "area": defaultdict(list)}
+    for p, by_kb in base.items():
+        for kb, r in sorted(by_kb.items()):
+            e, ar = num(r.get("e_total_pj")), num(r.get("area_um2"))
+            sh, per = num(r.get("e_sram_share")), num(r.get("period_pes_ns"))
+            if e is not None:
+                out["energy"][p].append((kb, e))
+            if ar is not None:
+                out["area"][p].append((kb, ar))
+            if sh is not None:
+                out["sram_share"][p].append((kb, 100.0 * sh))
+            if per is not None:
+                out["period"][p].append((kb, 1000.0 * per))
+            s = sens.get((p, kb))
+            if s:
+                lo, hi = num(s.get("e_min_pj")), num(s.get("e_max_pj"))
+                if lo is not None and hi is not None:
+                    bands["energy"][p].append((kb, lo, hi))
+                lo, hi = num(s.get("area_min_um2")), num(s.get("area_max_um2"))
+                if lo is not None and hi is not None:
+                    bands["area"][p].append((kb, lo, hi))
+    return out, bands
 
 
 # ---- logic energy, PPA, latency ----------------------------------------------
@@ -417,6 +513,21 @@ def log_y(ax):
     ax.grid(True, which="minor", alpha=0.1)
 
 
+def log_x(ax):
+    """Log x axis in plain numbers, ticks as log_y picks them."""
+    ax.set_xscale("log")
+    lo, hi = ax.get_xlim()
+    loc = None
+    for subs in ((1.0, 2.0, 5.0), (1.0, 2.0, 3.0, 5.0), tuple(float(s) for s in range(1, 10))):
+        cand = LogLocator(base=10, subs=subs)
+        if sum(lo <= t <= hi for t in cand.tick_values(lo, hi)) >= 3:
+            loc = cand
+            break
+    ax.xaxis.set_major_locator(loc or MaxNLocator(nbins=4))
+    ax.xaxis.set_major_formatter(FuncFormatter(plain))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+
+
 def linear_y(ax):
     ax.set_ylim(bottom=0)
     ax.ticklabel_format(axis="y", style="plain", useOffset=False)
@@ -434,9 +545,10 @@ def draw(ax, series, log):
     return drawn
 
 
-def figure(panels, log, sharey, path, hline=None):
+def figure(panels, log, sharey, path, hline=None, bands=None):
     """panels: [(column title, y label or None, {predictor: [(kb, y)]})].
-    hline: {panel index: (y, label)} reference lines."""
+    hline: {panel index: (y, label)} reference lines. bands: {panel index:
+    {predictor: [(kb, low, high)]}} shaded ranges."""
     budgets = sorted({x for _, _, s in panels for pts in s.values() for x, _ in pts})
     if not budgets:
         print(f"  no data, skipped {path}")
@@ -445,7 +557,12 @@ def figure(panels, log, sharey, path, hline=None):
     fig, axes = plt.subplots(1, len(panels), figsize=(3.9 * len(panels), h),
                              squeeze=False, sharey=sharey)
     drawn = set()
-    for ax, (_, _, series) in zip(axes[0], panels):        # all data first (shared y range)
+    for i, (ax, (_, _, series)) in enumerate(zip(axes[0], panels)):  # data first (shared y range)
+        for p, pts in ((bands or {}).get(i) or {}).items():
+            pts = sorted(q for q in pts if not log or q[1] > 0)
+            if pts:
+                ax.fill_between([x for x, _, _ in pts], [lo for _, lo, _ in pts],
+                                [hi for _, _, hi in pts], color=STYLE[p][1], alpha=0.15, lw=0)
         drawn |= draw(ax, series, log)
     for i, (ax, (title, ylabel, _)) in enumerate(zip(axes[0], panels)):
         if hline and i in hline:
@@ -461,6 +578,48 @@ def figure(panels, log, sharey, path, hline=None):
             ax.set_ylabel(ylabel)
     fig.tight_layout(rect=(0, 0.4 / h, 1, 1))             # bottom 0.4 in: legend
     handles = [Line2D([], [], color=c, marker=m, lw=1.8, ms=6, label=lab)
+               for p, (lab, c, m) in STYLE.items() if p in drawn]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0),
+               ncol=len(handles), frameon=False, fontsize=10)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  -> {path}")
+
+
+def tradeoff_figure(base, log, path, title_note):
+    """Total energy and total area against MPKBr, one curve per predictor
+    through its budgets."""
+    panels = [("e_total_pj", "Logic + SRAM energy", "Energy [pJ / cond. branch]"),
+              ("area_um2", "Logic + SRAM area", "Area [µm²]")]
+    h = 4.2
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), h), squeeze=False)
+    drawn = set()
+    for ax, (col, title, ylabel) in zip(axes[0], panels):
+        for p, (_, colour, marker) in STYLE.items():
+            pts = sorted((kb, num(r.get("mpkbr")), num(r.get(col))) for kb, r in base.get(p, {}).items())
+            pts = [q for q in pts if q[1] is not None and q[2] is not None and q[1] > 0
+                   and (not log or q[2] > 0)]
+            if not pts:
+                continue
+            ax.plot([x for _, x, _ in pts], [y for _, _, y in pts], color=colour, marker=marker,
+                    lw=1.5, ms=6)
+            for kb, x, y in pts:
+                ax.annotate(f"{kb:g}", (x, y), textcoords="offset points", xytext=(4, 4),
+                            fontsize=7, color=colour)
+            drawn.add(p)
+        log_x(ax)
+        ax.grid(True, which="major", alpha=0.3)
+        log_y(ax) if log else linear_y(ax)
+        ax.set_title(f"{title} vs accuracy", fontsize=11)
+        ax.set_xlabel("MPKBr, mean over traces (labels: budget, AU)")
+        ax.set_ylabel(ylabel)
+    if not drawn:
+        plt.close(fig)
+        print(f"  no data, skipped {path}")
+        return
+    fig.suptitle(title_note, fontsize=9, y=0.995)
+    fig.tight_layout(rect=(0, 0.4 / h, 1, 0.97))
+    handles = [Line2D([], [], color=c, marker=m, lw=1.5, ms=6, label=lab)
                for p, (lab, c, m) in STYLE.items() if p in drawn]
     fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0),
                ncol=len(handles), frameon=False, fontsize=10)
@@ -486,6 +645,10 @@ def main():
     ap.add_argument("--max-kb", type=float, default=None,
                     help="plot only budgets up to this many KB (default: all)")
     ap.add_argument("--out", default=os.path.join(EVAL_DIR, "plots"))
+    ap.add_argument("--ppa", default=os.path.join(EVAL_DIR, "ppa"),
+                    help="ppa_combine.py's output: MPKBr CSV destination, total / tradeoff data")
+    ap.add_argument("--mpkbr-csv", default=None,
+                    help="MPKBr CSV (default <ppa>/mpkbr_<mode>.csv; 'none': not written)")
     ap.add_argument("--format", default="png", choices=["png", "pdf", "svg"])
     a = ap.parse_args()
     bpc = os.path.join(a.cbp, "scripts", "bp-comparison")
@@ -515,7 +678,13 @@ def main():
         sys.exit("none of the requested traces is in the CSVs")
     os.makedirs(a.out, exist_ok=True)
 
-    acc = mpkbr_series(rows, traces, a)
+    acc, recs = mpkbr_series(rows, traces, a)
+    mp_csv = a.mpkbr_csv or (None if a.max_kb is not None
+                             else os.path.join(a.ppa, f"mpkbr_{a.mpkbr}.csv"))
+    if mp_csv and mp_csv != "none" and recs:
+        write_mpkbr_csv(mp_csv, recs)
+    elif a.max_kb is not None and not a.mpkbr_csv:
+        print("  MPKBr CSV not written (--max-kb: it would miss budgets; give --mpkbr-csv)")
     ppa = ppa_series(rows, traces)
     energy = energy_series(rows, traces)
     lat, cycles = latency_series(rows, traces)
@@ -548,11 +717,44 @@ def main():
                   ("Prediction path", "Last stage [ps]", lat["pred_ps"]),
                   ("Occupancy", "Busy cycles / cond. branch", lat["busy"])]
     lat_ref = {0: (1000.0 * clk, f"target {clk:g} ns")} if clk else None
+
+    # logic + SRAM, once ppa_combine.py has run
+    comb = load_combined(a.ppa, a.max_kb)
+    tot_panels = None
+    if comb and comb[0]:
+        base, sens = comb
+        tot, bands = combined_series(base, sens)
+        r0 = next(r for by in base.values() for r in by.values())
+        note = (f"logic + SRAM, baseline {r0.get('scenario')}, {num(r0.get('cpb')):g} host cycles per "
+                f"cond. branch; MPKBr: {r0.get('mpkbr_src') or 'see ppa_combine.py'}")
+        print(f"Logic + SRAM ({note})")
+        table("Total energy [pJ / cond. branch] (mean over traces)", tot["energy"], ".3f")
+        table("  ... low end over the corners", {p: [(kb, lo) for kb, lo, _ in v]
+                                                 for p, v in bands["energy"].items()}, ".3f")
+        table("  ... high end over the corners", {p: [(kb, hi) for kb, _, hi in v]
+                                                  for p, v in bands["energy"].items()}, ".3f")
+        table("Total area [µm²]", tot["area"], ".0f")
+        table("SRAM share of the energy [%]", tot["sram_share"], ".1f")
+        table("Cycle with the SRAM (CACTI access time, pessimistic) [ps]", tot["period"], ".1f")
+        tot_panels = [("Logic + SRAM energy", "Energy [pJ / cond. branch]", tot["energy"]),
+                      ("Logic + SRAM area", "Area [µm²]", tot["area"]),
+                      ("SRAM share of the energy", "Share [%]", tot["sram_share"]),
+                      ("Cycle with the SRAM", "Logic + SRAM access [ps]", tot["period"])]
+        tot_bands = {0: bands["energy"], 1: bands["area"]}
+        tot_ref = {3: (1000.0 * clk, f"target {clk:g} ns")} if clk else None
+    else:
+        print(f"  no {os.path.join(a.ppa, 'ppa_table.csv')} yet: run ppa_combine.py, then this "
+              f"script again, for the logic + SRAM figures")
+
     for log, scale in ((True, "log"), (False, "linear")):
         figure(acc_panels, log, a.sharey, os.path.join(a.out, f"mpkbr_{scale}.{a.format}"))
         figure(energy_panels, log, a.sharey, os.path.join(a.out, f"energy_{scale}.{a.format}"))
         figure(ppa_panels, log, False, os.path.join(a.out, f"ppa_{scale}.{a.format}"))
         figure(lat_panels, log, False, os.path.join(a.out, f"latency_{scale}.{a.format}"), lat_ref)
+        if tot_panels:
+            figure(tot_panels, log, False, os.path.join(a.out, f"total_{scale}.{a.format}"),
+                   tot_ref, tot_bands)
+            tradeoff_figure(base, log, os.path.join(a.out, f"tradeoff_{scale}.{a.format}"), note)
 
 
 if __name__ == "__main__":
