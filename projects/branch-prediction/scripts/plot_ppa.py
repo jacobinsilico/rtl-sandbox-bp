@@ -31,7 +31,24 @@
 #                      prediction latency in ns at that period, the
 #                      prediction-path delay of the last stage, and the busy
 #                      cycles per conditional branch.
+#     area_power_latency_logic_<scale>
+#                      before SRAM modelling: logic area, logic power and the
+#                      end-to-end prediction latency (prediction cycles x the
+#                      critical path, the SRAM read at the STA's 200 ps
+#                      placeholder clock-to-Q).
 #   Once ppa_combine.py has written <ppa>/ppa_table.csv (logic + SRAM):
+#     area_power_latency_total_<scale>
+#                      after SRAM modelling, same columns: logic + SRAM area
+#                      (band: the area corners); logic + SRAM power, at the
+#                      same rate as the logic power (one branch per busy-cycle
+#                      count of the bench: measured logic power + SRAM dynamic
+#                      energy over busy cycles x clock + SRAM leakage); and the
+#                      end-to-end prediction latency with the CACTI access
+#                      time in place of the placeholder (prediction cycles x
+#                      ppa_combine.py's cycle; line: pessimistic bound, band:
+#                      optimistic to pessimistic). Each figure is scaled on
+#                      its own; --apl-sharey gives the pair the same y range
+#                      column by column.
 #     total_<scale>    total energy per conditional branch (logic + SRAM
 #                      reads / writes + SRAM leakage) and total area (logic +
 #                      SRAM), in ppa_combine.py's baseline scenario; the band
@@ -83,6 +100,8 @@
 #                        tdd_dl_mu_v1_0 tdd_ul_mu_v1_0)
 #     --sharey           one y range across the MPKBr columns, and one across
 #                        the energy columns
+#     --apl-sharey       one y range per column across the two
+#                        area_power_latency figures (default: each its own)
 #     --max-kb KB        plot only budgets up to KB (default: all budgets)
 #     --out DIR          default eval/plots/
 #     --ppa DIR          ppa_combine.py's output (default eval/ppa/): where the
@@ -102,6 +121,9 @@
 #   <out>/energy_log.<fmt>   <out>/energy_linear.<fmt>
 #   <out>/ppa_log.<fmt>      <out>/ppa_linear.<fmt>
 #   <out>/latency_log.<fmt>  <out>/latency_linear.<fmt>
+#   <out>/area_power_latency_logic_log.<fmt>   <out>/area_power_latency_logic_linear.<fmt>
+#   <out>/area_power_latency_total_log.<fmt>   <out>/area_power_latency_total_linear.<fmt>
+#                                                          (with ppa_combine.py's output)
 #   <out>/total_log.<fmt>    <out>/total_linear.<fmt>      (with ppa_combine.py's output)
 #   <out>/tradeoff_log.<fmt> <out>/tradeoff_linear.<fmt>   (with ppa_combine.py's output)
 #   <out>/no_hp/...          the same figures without the hashed perceptron
@@ -385,6 +407,61 @@ def combined_series(base, sens):
     return out, bands
 
 
+def logic_apl_panels(ppa, lat):
+    """Before SRAM modelling: logic area, logic power and the end-to-end
+    prediction latency (the SRAM read at the STA's placeholder)."""
+    return [("Logic area", "Area [µm²]", ppa["area_um2"]),
+            ("Logic power", "Power [µW]", ppa["p_total_w"]),
+            ("Prediction latency", "Latency [ns]", lat["lat_ns"])]
+
+
+def total_apl(base, bands, ppa, cycles, clk_ns):
+    """After SRAM modelling (ppa_combine.py's baseline): -> (panels, bands).
+      area     logic + SRAM; band: the area corners
+      power    the measured logic power (µW, mean over the traces) + the SRAM
+               dynamic energy spread over the same time per branch (busy
+               cycles x clock) + the SRAM leakage power
+      latency  prediction cycles x the cycle with the CACTI access time;
+               line: pessimistic bound, band: optimistic to pessimistic"""
+    p_logic = {p: dict(pts) for p, pts in ppa["p_total_w"].items()}
+    area, power, latency, lat_band = (defaultdict(list) for _ in range(4))
+    for p, by_kb in base.items():
+        for kb, r in sorted(by_kb.items()):
+            ar = num(r.get("area_um2"))
+            if ar is not None:
+                area[p].append((kb, ar))
+            pl, busy = p_logic.get(p, {}).get(kb), num(r.get("busy_cyc"))
+            rd, wr, leak = (num(r.get(k)) for k in ("e_sram_rd_pj", "e_sram_wr_pj", "sram_leak_uw"))
+            if None not in (pl, busy, rd, wr, leak) and busy > 0 and clk_ns:
+                power[p].append((kb, pl + 1000.0 * (rd + wr) / (busy * clk_ns) + leak))  # pJ/ns = mW
+            n = cycles.get(p, {}).get(kb)
+            lo, hi = num(r.get("period_opt_ns")), num(r.get("period_pes_ns"))
+            if n and hi is not None:
+                latency[p].append((kb, n * hi))
+                if lo is not None:
+                    lat_band[p].append((kb, n * lo, n * hi))
+    panels = [("Logic + SRAM area", "Area [µm²]", area),
+              ("Logic + SRAM power", "Power [µW]", power),
+              ("Prediction latency with SRAM", "Latency [ns]", latency)]
+    return panels, {0: dict(bands.get("area", {})), 2: lat_band}
+
+
+def common_ylims(panel_sets, log, band_sets=()):
+    """{panel index: (low, high)} covering that panel in every set (and its
+    bands), so a before / after pair shares its y ranges column by column."""
+    vals = defaultdict(list)
+    for panels in panel_sets:
+        for i, (_, _, series) in enumerate(panels):
+            vals[i] += [y for pts in series.values() for _, y in pts
+                        if y is not None and (not log or y > 0)]
+    for bands in band_sets:
+        for i, b in (bands or {}).items():
+            vals[i] += [v for pts in b.values() for _, lo, hi in pts for v in (lo, hi)
+                        if v is not None and (not log or v > 0)]
+    return {i: ((min(v) / 1.25, max(v) * 1.25) if log else (0.0, max(v) * 1.08))
+            for i, v in vals.items() if v}
+
+
 # ---- logic energy, PPA, latency ----------------------------------------------
 
 def check_windows(what, windows):
@@ -569,10 +646,11 @@ def draw(ax, series, log):
     return drawn
 
 
-def figure(panels, log, sharey, path, hline=None, bands=None):
+def figure(panels, log, sharey, path, hline=None, bands=None, ylims=None):
     """panels: [(column title, y label or None, {predictor: [(kb, y)]})].
     hline: {panel index: (y, label)} reference lines. bands: {panel index:
-    {predictor: [(kb, low, high)]}} shaded ranges."""
+    {predictor: [(kb, low, high)]}} shaded ranges. ylims: {panel index:
+    (low, high)} fixed y ranges (e.g. shared by a before / after pair)."""
     budgets = sorted({x for _, _, s in panels for pts in s.values() for x, _ in pts})
     if not budgets:
         print(f"  no data, skipped {path}")
@@ -595,6 +673,9 @@ def figure(panels, log, sharey, path, hline=None, bands=None):
             ax.annotate(lab, (0.98, y), xycoords=("axes fraction", "data"), fontsize=8,
                         color="0.3", va="top", ha="right")
         budget_axis(ax, budgets)
+        if ylims and i in ylims:
+            ax.set_yscale("log" if log else "linear")
+            ax.set_ylim(*ylims[i])
         log_y(ax) if log else linear_y(ax)
         ax.set_title(title, fontsize=11)
         ax.set_xlabel(X_LABEL)
@@ -666,6 +747,8 @@ def main():
     ap.add_argument("--traces", nargs="+", default=TRACES)
     ap.add_argument("--sharey", action="store_true",
                     help="one y range across the MPKBr columns, and one across the energy columns")
+    ap.add_argument("--apl-sharey", action="store_true",
+                    help="one y range per column across the two area_power_latency figures")
     ap.add_argument("--max-kb", type=float, default=None,
                     help="plot only budgets up to this many KB (default: all)")
     ap.add_argument("--out", default=os.path.join(EVAL_DIR, "plots"))
@@ -741,10 +824,11 @@ def main():
                   ("Prediction path", "Last stage [ps]", lat["pred_ps"]),
                   ("Occupancy", "Busy cycles / cond. branch", lat["busy"])]
     lat_ref = {0: (1000.0 * clk, f"target {clk:g} ns")} if clk else None
+    apl_logic = logic_apl_panels(ppa, lat)          # before SRAM modelling
 
     # logic + SRAM, once ppa_combine.py has run
     comb = load_combined(a.ppa, a.max_kb)
-    tot_panels = None
+    tot_panels = apl_total = apl_bands = None
     if comb and comb[0]:
         base, sens = comb
         tot, bands = combined_series(base, sens)
@@ -766,6 +850,11 @@ def main():
                       ("Cycle with the SRAM", "Logic + SRAM access [ps]", tot["period"])]
         tot_bands = {0: bands["energy"], 1: bands["area"]}
         tot_ref = {3: (1000.0 * clk, f"target {clk:g} ns")} if clk else None
+        apl_total, apl_bands = total_apl(base, bands, ppa, cycles, clk)
+        table("Logic + SRAM power [µW] (logic power + SRAM dynamic over the busy cycles "
+              "+ SRAM leakage)", apl_total[1][2], ".2f")
+        table("Prediction latency with the SRAM (CACTI access time, pessimistic) [ns]",
+              apl_total[2][2], ".3f")
     else:
         print(f"  no {os.path.join(a.ppa, 'ppa_table.csv')} yet: run ppa_combine.py, then this "
               f"script again, for the logic + SRAM figures")
@@ -784,6 +873,18 @@ def main():
                    os.path.join(out, f"ppa_{scale}.{a.format}"))
             figure(without(lat_panels, excl), log, False,
                    os.path.join(out, f"latency_{scale}.{a.format}"), lat_ref)
+            before = without(apl_logic, excl)
+            after = without(apl_total, excl) if apl_total else None
+            after_bands = without_bands(apl_bands, excl) if apl_total else None
+            ylims = (common_ylims([before, after], log, [after_bands])
+                     if after and a.apl_sharey else None)
+            figure(before, log, False,
+                   os.path.join(out, f"area_power_latency_logic_{scale}.{a.format}"),
+                   ylims=ylims)
+            if after:
+                figure(after, log, False,
+                       os.path.join(out, f"area_power_latency_total_{scale}.{a.format}"),
+                       bands=after_bands, ylims=ylims)
             if tot_panels:
                 figure(without(tot_panels, excl), log, False,
                        os.path.join(out, f"total_{scale}.{a.format}"),
