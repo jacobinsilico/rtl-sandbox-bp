@@ -56,6 +56,11 @@
 #   Every figure is written twice: <scale> = log (log y axis) and linear (y
 #   axis from 0). x axis: storage budget in area units, 1 AU = 1 KB.
 #
+#   Every figure is also drawn for each predictor set in PLOT_SETS: all four
+#   predictors in <out>/, and the same figures without the hashed perceptron
+#   in <out>/no_hp/. A predictor keeps its colour and marker in every set;
+#   the printed tables and the MPKBr CSV always cover all four.
+#
 #   mpkbr / energy / ppa / latency are logic only: the SRAMs are outside the
 #   synthesized core, so neither the power nor the energy includes them (the
 #   total / tradeoff figures do). Rows of the old flow (no activity
@@ -92,13 +97,14 @@
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --mpkbr rtl
 #     /usr/bin/python3 projects/branch-prediction/scripts/plot_ppa.py --max-kb 16
 #
-# Output:
+# Output (every file once in <out>/ and once in <out>/no_hp/):
 #   <out>/mpkbr_log.<fmt>    <out>/mpkbr_linear.<fmt>
 #   <out>/energy_log.<fmt>   <out>/energy_linear.<fmt>
 #   <out>/ppa_log.<fmt>      <out>/ppa_linear.<fmt>
 #   <out>/latency_log.<fmt>  <out>/latency_linear.<fmt>
 #   <out>/total_log.<fmt>    <out>/total_linear.<fmt>      (with ppa_combine.py's output)
 #   <out>/tradeoff_log.<fmt> <out>/tradeoff_linear.<fmt>   (with ppa_combine.py's output)
+#   <out>/no_hp/...          the same figures without the hashed perceptron
 #   <ppa>/mpkbr_<mode>.csv
 #
 #   Order for the logic + SRAM figures: plot_ppa.py (writes the MPKBr CSV),
@@ -132,6 +138,13 @@ STYLE = {
     "hashed_perceptron": ("Hashed Perceptron", "#009E73", "^"),
     "tage_cb":           ("TAGE",              "#D55E00", "D"),
 }
+
+# Predictor sets every figure is drawn for: (subdirectory of --out, "" = --out
+# itself; predictors left out of that set)
+PLOT_SETS = [
+    ("",      ()),
+    ("no_hp", ("hashed_perceptron",)),
+]
 
 # Prediction latency in cycles (request handshake -> pred_resp_valid), from
 # the cores' pipelining knobs; a knob missing from the row's rtl_params takes
@@ -483,6 +496,17 @@ def table(title, series, fmt):
 # Plotting
 # =============================================================================
 
+def without(panels, excl):
+    """panels [(title, y label, {predictor: points})] minus the predictors in excl."""
+    return [(title, ylabel, {p: v for p, v in series.items() if p not in excl})
+            for title, ylabel, series in panels]
+
+
+def without_bands(bands, excl):
+    """{panel index: {predictor: band}} minus the predictors in excl."""
+    return {i: {p: v for p, v in b.items() if p not in excl} for i, b in (bands or {}).items()}
+
+
 def plain(v, _pos=None):
     """Tick label in plain numbers: 2, 0.5, 20000 (no 1e+04)."""
     return f"{v:.0f}" if v >= 1 and float(v).is_integer() else f"{v:g}"
@@ -746,15 +770,26 @@ def main():
         print(f"  no {os.path.join(a.ppa, 'ppa_table.csv')} yet: run ppa_combine.py, then this "
               f"script again, for the logic + SRAM figures")
 
-    for log, scale in ((True, "log"), (False, "linear")):
-        figure(acc_panels, log, a.sharey, os.path.join(a.out, f"mpkbr_{scale}.{a.format}"))
-        figure(energy_panels, log, a.sharey, os.path.join(a.out, f"energy_{scale}.{a.format}"))
-        figure(ppa_panels, log, False, os.path.join(a.out, f"ppa_{scale}.{a.format}"))
-        figure(lat_panels, log, False, os.path.join(a.out, f"latency_{scale}.{a.format}"), lat_ref)
-        if tot_panels:
-            figure(tot_panels, log, False, os.path.join(a.out, f"total_{scale}.{a.format}"),
-                   tot_ref, tot_bands)
-            tradeoff_figure(base, log, os.path.join(a.out, f"tradeoff_{scale}.{a.format}"), note)
+    for sub, excl in PLOT_SETS:
+        out = os.path.join(a.out, sub) if sub else a.out
+        os.makedirs(out, exist_ok=True)
+        left_out = ", ".join(STYLE[p][0] for p in excl if p in STYLE)
+        print(f"Figures -> {out}" + (f" (without {left_out})" if left_out else " (all predictors)"))
+        for log, scale in ((True, "log"), (False, "linear")):
+            figure(without(acc_panels, excl), log, a.sharey,
+                   os.path.join(out, f"mpkbr_{scale}.{a.format}"))
+            figure(without(energy_panels, excl), log, a.sharey,
+                   os.path.join(out, f"energy_{scale}.{a.format}"))
+            figure(without(ppa_panels, excl), log, False,
+                   os.path.join(out, f"ppa_{scale}.{a.format}"))
+            figure(without(lat_panels, excl), log, False,
+                   os.path.join(out, f"latency_{scale}.{a.format}"), lat_ref)
+            if tot_panels:
+                figure(without(tot_panels, excl), log, False,
+                       os.path.join(out, f"total_{scale}.{a.format}"),
+                       tot_ref, without_bands(tot_bands, excl))
+                tradeoff_figure({p: v for p, v in base.items() if p not in excl}, log,
+                                os.path.join(out, f"tradeoff_{scale}.{a.format}"), note)
 
 
 if __name__ == "__main__":
