@@ -38,17 +38,18 @@
 #                      placeholder clock-to-Q).
 #   Once ppa_combine.py has written <ppa>/ppa_table.csv (logic + SRAM):
 #     area_power_latency_total_<scale>
-#                      after SRAM modelling, same columns: logic + SRAM area
-#                      (band: the area corners); logic + SRAM power, at the
+#                      after SRAM modelling, same columns: logic + SRAM area;
+#                      logic + SRAM power, at the
 #                      same rate as the logic power (one branch per busy-cycle
 #                      count of the bench: measured logic power + SRAM dynamic
 #                      energy over busy cycles x clock + SRAM leakage); and the
 #                      end-to-end prediction latency with the CACTI access
 #                      time in place of the placeholder (prediction cycles x
-#                      ppa_combine.py's cycle; line: pessimistic bound, band:
-#                      optimistic to pessimistic). Each figure is scaled on
-#                      its own; --apl-sharey gives the pair the same y range
-#                      column by column.
+#                      ppa_combine.py's cycle, pessimistic bound). Lines only,
+#                      like the other figures; --apl-bands shades the area
+#                      corners and the optimistic-to-pessimistic latency range.
+#                      Each figure is scaled on its own; --apl-sharey gives
+#                      the pair the same y range column by column.
 #     total_<scale>    total energy per conditional branch (logic + SRAM
 #                      reads / writes + SRAM leakage) and total area (logic +
 #                      SRAM), in ppa_combine.py's baseline scenario; the band
@@ -102,6 +103,8 @@
 #                        the energy columns
 #     --apl-sharey       one y range per column across the two
 #                        area_power_latency figures (default: each its own)
+#     --apl-bands        shade the area corners and the latency bounds on
+#                        area_power_latency_total (default: lines only)
 #     --max-kb KB        plot only budgets up to KB (default: all budgets)
 #     --out DIR          default eval/plots/
 #     --ppa DIR          ppa_combine.py's output (default eval/ppa/): where the
@@ -749,6 +752,8 @@ def main():
                     help="one y range across the MPKBr columns, and one across the energy columns")
     ap.add_argument("--apl-sharey", action="store_true",
                     help="one y range per column across the two area_power_latency figures")
+    ap.add_argument("--apl-bands", action="store_true",
+                    help="shade the area corners and the latency bounds on area_power_latency_total")
     ap.add_argument("--max-kb", type=float, default=None,
                     help="plot only budgets up to this many KB (default: all)")
     ap.add_argument("--out", default=os.path.join(EVAL_DIR, "plots"))
@@ -875,7 +880,7 @@ def main():
                    os.path.join(out, f"latency_{scale}.{a.format}"), lat_ref)
             before = without(apl_logic, excl)
             after = without(apl_total, excl) if apl_total else None
-            after_bands = without_bands(apl_bands, excl) if apl_total else None
+            after_bands = without_bands(apl_bands, excl) if apl_total and a.apl_bands else None
             ylims = (common_ylims([before, after], log, [after_bands])
                      if after and a.apl_sharey else None)
             figure(before, log, False,

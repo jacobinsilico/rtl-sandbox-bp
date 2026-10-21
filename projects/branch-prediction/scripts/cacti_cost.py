@@ -30,19 +30,23 @@
 #        times, and records the padding (an overestimate, like a compiler's
 #        minimum macro size). An array that still fails is status=fail: cost
 #        it as flops in the combine step;
-#     4. parses access time, wire delay (H-tree in/out + bitline), read and
-#        write energy, leakage (subthreshold + gate), area and area
-#        efficiency. The cells' share of the leakage: CACTI's breakdown if it
-#        prints one (CACTI 7.0.3 prints zeros); else, when both cell types
-#        are costed with the same geometry, leak(hp cells) - leak(lstp cells),
-#        i.e. LSTP cell leakage taken as ~0 (leak_split says which);
-#     5. scales to 7 nm at --dst-vdd: delay, dynamic energy and the
-#        periphery's leakage with the periphery's row, the cells' leakage
-#        with the cell type's row, area with the Table 3 geometric mean.
-#        CACTI's 22 nm is Stillmaker's 20 nm multi-gate row. Delay is a bound
-#        pair: everything scaled (opt), and the wire part held unscaled (pes).
-#        --calib-fo4-ps replaces Stillmaker's 7 nm FO4 with a measured ASAP7
-#        FO4 (delay only).
+#     4. parses access time and its components (H-tree in / out, bitline),
+#        read and write energy, leakage (subthreshold + gate), area and area
+#        efficiency. The cells' share of the leakage: when both cell types are
+#        costed with the same geometry, leak(hp cells) - leak(lstp cells),
+#        i.e. LSTP cell leakage taken as ~0 (leak_split says so). CACTI's own
+#        breakdown lines are never used: CACTI 7.0 copies them into its
+#        result only when power gating is on, otherwise they are
+#        uninitialized memory (zeros, or garbage);
+#     5. scales to 7 nm at --dst-vdd: dynamic energy and the periphery's
+#        leakage with the periphery's row, the cells' leakage with the cell
+#        type's row, area with the Table 3 geometric mean. Delay: the bitline
+#        part (set by the cell's read current) with the cell type's row, the
+#        rest with the periphery's row (opt); the pessimistic bound (pes)
+#        also holds the H-tree part (wires) unscaled. CACTI's 22 nm is
+#        Stillmaker's 20 nm multi-gate row. --calib-fo4-ps replaces
+#        Stillmaker's 7 nm FO4 of the periphery with a measured ASAP7 FO4
+#        (delay only).
 #   --ports both (default) costs every array as 1r1w AND 1rw, so the combine
 #   step can take 1rw where the bench saw no same-cycle read + write.
 #   Identical geometries are run once (--jobs in parallel). Raw configs and
@@ -51,7 +55,8 @@
 #
 #   Output:
 #     OUT/cacti_arrays.csv   one row per array x port model x cell type.
-#       *_22 = CACTI at 22 nm, *_7 = scaled. Time in ns, energy in pJ per row
+#       *_22 = CACTI at 22 nm, *_7 = scaled (t_bitline_22 / t_htree_22: the
+#       access time's bitline and H-tree parts). Time in ns, energy in pJ per row
 #       access, leakage in uW, area in um^2. cyc_opt / cyc_pes = cycles at
 #       --clk-ns. *_7_used: the unused bits' cell area / cell leakage taken
 #       out (periphery kept), a lower estimate next to the costed one
@@ -370,8 +375,7 @@ def leak_parts(vals, costed, cell, done, job):
     tot = total_leak(vals)
     if tot is None:
         return None, None, "none"
-    if vals.get("leak_cells"):                          # CACTI's breakdown, if non-zero
-        return tot, vals["leak_cells"], "cacti"
+    # CACTI's breakdown lines are uninitialized without power gating: not used
     other = done.get(job[:2] + ("lstp" if cell == "hp" else "hp",))
     if other and other[0] is not None and (other[1], other[2]) == costed \
             and total_leak(other[0]) is not None:
@@ -453,8 +457,11 @@ def main():
     kd, ke, ka, kl_hp = f_hp["delay"], f_hp["energy"], f_hp["area"], f_hp["leakage"]
     kl = {c: factors(((c, SRC_NODE), src_vdd[c]), ((c, DST_NODE), a.dst_vdd))["leakage"]
           for c in a.cells}
-    print(f"factors 22->7 nm ({a.periph} periphery, {a.temp_k} K): delay x{kd:.4f}  "
-          f"energy x{ke:.4f}  area x{ka:.4f}  leak periphery x{kl_hp:.4f}  "
+    kd_cell = {c: factors(((c, SRC_NODE), src_vdd[c]), ((c, DST_NODE), a.dst_vdd))["delay"]
+               for c in a.cells}
+    print(f"factors 22->7 nm ({a.periph} periphery, {a.temp_k} K): delay x{kd:.4f} "
+          + "(" + ", ".join(f"bitline[{c}] x{kd_cell[c]:.4f}" for c in a.cells) + ")  "
+          + f"energy x{ke:.4f}  area x{ka:.4f}  leak periphery x{kl_hp:.4f}  "
           + "  ".join(f"leak cells[{c}] x{kl[c]:.4f}" for c in a.cells))
     if a.calib_fo4_ps:
         print(f"  7 nm FO4 calibrated: {a.calib_fo4_ps} ps (Table 5: "
@@ -497,8 +504,9 @@ def main():
         bits_c = d * b * 8
         util = r["depth"] * r["width"] / bits_c
         t = vals.get("t_acc")
-        parts = [vals.get(x) for x in ("t_htree_in", "t_htree_out", "t_bitline")]
-        wire = sum(p for p in parts if p is not None) if any(p is not None for p in parts) else None
+        tree = [vals.get(x) for x in ("t_htree_in", "t_htree_out")]
+        htree = sum(p for p in tree if p is not None) if any(p is not None for p in tree) else None
+        bitl = vals.get("t_bitline")
         leak, cells_lk, split = leak_parts(vals, (d, b), cell, done, job)
         if leak is None:
             leak7 = None
@@ -508,8 +516,11 @@ def main():
             leak7 = leak * kl_hp                # mostly periphery (see the header)
         area = vals.get("area_mm2")
         eff = vals.get("eff_pct")
-        t_opt = t * kd if t is not None else None
-        t_pes = (t - wire) * kd + wire if t is not None and wire is not None else None
+        # bitline with the cell's row, the rest with the periphery's (opt);
+        # the H-tree part also held unscaled (pes)
+        t_bl, t_ht = (bitl or 0.0), (htree or 0.0)
+        t_opt = (t - t_bl) * kd + t_bl * kd_cell[cell] if t is not None else None
+        t_pes = (t - t_bl - t_ht) * kd + t_bl * kd_cell[cell] + t_ht if t is not None else None
         area7 = area * ka if area is not None else None
         area7_used = (area7 * (1 - eff / 100.0 * (1 - util))
                       if area7 is not None and eff is not None else None)
@@ -519,7 +530,8 @@ def main():
             "status": ("ok" if step == 0 else "byte-rows" if step < len(job[0]) else "padded")
             + ("-partial" if missing else ""),
             "depth_costed": d, "row_bytes_costed": b, "util": round(util, 4),
-            "t_acc_22": rnd(t), "t_wire_22": rnd(wire), "t_cyc_22": rnd(vals.get("t_cyc")),
+            "t_acc_22": rnd(t), "t_bitline_22": rnd(bitl), "t_htree_22": rnd(htree),
+            "t_cyc_22": rnd(vals.get("t_cyc")),
             "e_rd_22": rnd(vals.get("e_rd"), 1e3), "e_wr_22": rnd(vals.get("e_wr"), 1e3),
             "leak_22": rnd(leak, 1e3), "leak_cells_22": rnd(cells_lk, 1e3), "leak_split": split,
             "area_22": rnd(area, 1e6), "eff_pct": rnd(eff),
@@ -541,7 +553,8 @@ def main():
                            f"({r['depth']}x{r['width']} costed as {d}x{b}B)")
 
     cols = ["name", "depth", "width", "bits", "ports", "cell", "pack", "status",
-            "depth_costed", "row_bytes_costed", "util", "t_acc_22", "t_wire_22", "t_cyc_22",
+            "depth_costed", "row_bytes_costed", "util", "t_acc_22", "t_bitline_22", "t_htree_22",
+            "t_cyc_22",
             "e_rd_22", "e_wr_22", "leak_22", "leak_cells_22", "leak_split", "area_22", "eff_pct",
             "cell_um2_22", "t_opt_7", "t_pes_7", "cyc_opt", "cyc_pes", "e_rd_7", "e_wr_7",
             "leak_7", "area_7", "leak_7_used", "area_7_used", "raw"]
